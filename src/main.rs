@@ -120,8 +120,11 @@ fn read_bounded(path: &Path, limit: usize) -> anyhow::Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-struct Backend(HostHandle);
+struct Backend(HostHandle, f64);
 impl RpcBackend for Backend {
+    fn metrics(&self) -> Option<String> {
+        Some(self.0.metrics(self.1))
+    }
     fn health(&self, route: String) -> RpcFuture {
         let value = self.0.health(&route);
         Box::pin(async move { Ok(value) })
@@ -166,6 +169,9 @@ async fn stop_signal() -> anyhow::Result<()> {
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let process_start_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs_f64();
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--help"] || args == ["-h"] {
         println!(
@@ -292,7 +298,10 @@ async fn main() -> anyhow::Result<()> {
             return Err(error);
         }
     };
-    let app = api::router(Arc::new(Backend(host.handle.clone())), cookie.clone());
+    let app = api::router(
+        Arc::new(Backend(host.handle.clone(), process_start_time)),
+        cookie.clone(),
+    );
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let mut server = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -306,7 +315,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|listener| listener.local_addr())
         .transpose()?;
     let public_app = lattice_node::runtime::public_api::router_with_fetches(
-        Arc::new(Backend(host.handle.clone())),
+        Arc::new(Backend(host.handle.clone(), process_start_time)),
         config.public_read_rates,
         config.public_submit,
         config.public_read_fetches,

@@ -5,7 +5,10 @@ use lattice_block_tree::ChainTree;
 use std::sync::RwLock;
 
 #[derive(Clone, Default)]
-pub(super) struct PublishedHealth(Arc<RwLock<BTreeMap<String, Value>>>);
+pub(super) struct PublishedHealth(
+    Arc<RwLock<BTreeMap<String, Value>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
 impl PublishedHealth {
     pub(super) fn read(&self, route: &str) -> (u16, Value) {
         let query = route.split_once('?').map_or("", |(_, q)| q);
@@ -66,6 +69,30 @@ impl Host {
         }
         // Compute first; readers hold this lock only to clone a small DTO.
         *self.health.0.write().unwrap() = values;
+        self.health.1.store(
+            self.network.peers().len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+impl HostHandle {
+    /// Root operator metrics from published state, never the actor mailbox.
+    pub fn metrics(&self, process_start_time: f64) -> String {
+        let values = self.health.0.read().unwrap();
+        let root = values.get("Nexus");
+        let height = |field: &str| {
+            root.and_then(|v| v[field].as_str())
+                .and_then(|v| v.parse().ok())
+        };
+        super::super::metrics::render(&super::super::metrics::Sample {
+            chain_path: &["Nexus".into()],
+            validated_height: height("height"),
+            weighed_height: height("bestHeaderHeight"),
+            peers: self.health.1.load(std::sync::atomic::Ordering::Relaxed),
+            mempool_transactions: root.and_then(|v| v["mempoolCount"].as_u64()).unwrap_or(0),
+            process_start_time,
+        })
     }
 }
 
@@ -167,6 +194,9 @@ mod tests {
             handle.health("/health?chainPath=Nexus%2FAlpha"),
             (200, value)
         );
+        let metrics = handle.metrics(123.5);
+        assert!(metrics.contains("process_start_time_seconds{chain=\"Nexus\"} 123.5"));
+        assert!(!metrics.contains("lattice_chain_tip_height{"));
         for path in ["Nexus//Alpha", "Nexus/Alpha/", "Nexus/Beta", ""] {
             assert_eq!(handle.health(&format!("/health?chainPath={path}")).0, 404);
         }

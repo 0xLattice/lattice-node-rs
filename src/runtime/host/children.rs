@@ -39,15 +39,24 @@ impl Host {
             }
         }
     }
-    pub(super) fn child_tick(&mut self) -> anyhow::Result<()> {
+    pub(super) fn tick_fact_turn(&mut self) -> anyhow::Result<()> {
+        let storage = self.storage.clone();
+        let time = now();
+        storage.atomic_fact_turn(|| -> anyhow::Result<()> {
+            let effects = self.chain.tick(time)?;
+            self.queue.push_back(Work::Chain(effects));
+            for path in self.levels.ordered() {
+                let effects = self.levels.get_mut(&path).unwrap().tick(time)?;
+                self.queue.push_back(Work::Child(path, effects));
+            }
+            // Swift attributes parent runs after every level's tick, before
+            // persisting the one node batch or publishing any queued effects.
+            self.wake_children()?;
+            Ok(())
+        })?;
+        // Worker results are separate proofVerified/derived events, not part
+        // of NodeEvent.tick. Each completion keeps its own durable barrier.
         for path in self.levels.ordered() {
-            let effects = self.levels.get_mut(&path).unwrap().tick(now())?;
-            self.queue.push_back(Work::Child(path.clone(), effects));
-            let parent = self.child_parent(&path)?;
-            self.levels
-                .get_mut(&path)
-                .unwrap()
-                .schedule_derivations(&parent, &[]);
             self.child_proofs(&path)?;
         }
         Ok(())

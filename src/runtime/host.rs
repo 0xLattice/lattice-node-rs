@@ -437,12 +437,23 @@ impl Host {
             self.maintain_discovery().await?;
             tokio::select! {
              completion=self.preflights.next(), if self.preflights.active()=>{
-                let effects=self.mining.complete_root_preflight(completion?,now())?;
-                self.enqueue(effects);
+                match completion? {
+                    preflight::Completion::Root(done)=>{
+                        let effects=self.mining.complete_root_preflight(done,now())?;
+                        self.enqueue(effects);
+                    },
+                    preflight::Completion::Child(path,done)=>{
+                        if self.child_mining.contains_key(&path) {
+                            let parent=self.child_parent(&path)?;
+                            let effects=self.child_mining.get_mut(&path).unwrap().core.complete_child_preflight(done,&parent,now())?;
+                            self.enqueue_child_mining(&path,effects);
+                        }
+                    }
+                }
              },
              command=input.recv()=>match command {Some(Command::Request(route,body,reply))=>{self.api(route,body,reply)?},Some(Command::Volume(cid,reply))=>{let _=reply.send(self.storage.fetch_volume(&cid).and_then(operator::archive));},Some(Command::Shutdown)|None=>{let _=self.ledger.save();self.network.stop().await;return Ok(())}},
              event=self.network.next()=>match event?{Some(event)=>self.network_event(event).await?,None=>return Err(anyhow::anyhow!("Ivy stopped"))},
-             _=timer.tick()=>{if self.last_ledger_save.elapsed()>=std::time::Duration::from_secs(30){let _=self.ledger.save();self.last_ledger_save=std::time::Instant::now();}self.network.tick().await?;let effects=self.chain.tick(now())?;self.queue.push_back(Work::Chain(effects));self.child_tick()?;}
+             _=timer.tick()=>{if self.last_ledger_save.elapsed()>=std::time::Duration::from_secs(30){let _=self.ledger.save();self.last_ledger_save=std::time::Instant::now();}self.network.tick().await?;self.tick_fact_turn()?;}
             }
         }
     }
@@ -637,7 +648,13 @@ impl Host {
         while let Some(work) = self.queue.pop_front() {
             match work {
    Work::ReadEndpoints(id,path)=>self.network.lookup_read_endpoints(id,path).await?,
-   Work::ChildMining(path,effect)=>self.child_mining_effect(path,*effect).await?,
+   Work::ChildMining(path,effect)=>{
+    if let MiningEffect::Preflight(job)=effect.as_ref() {
+     if self.child_mining.get(&path).is_none_or(|m|m.core.state().tip_epoch()!=job.tip_epoch){continue;}
+     deferred_preflights.push_back(Work::ChildMining(path,effect));continue;
+    }
+    self.child_mining_effect(path,*effect).await?;
+   },
    Work::HostLevels(id,paths)=>{let response=match self.configure_children(paths).await{Ok(())=>(200,json!({"chains":self.levels.ordered().iter().map(|p|p.join("/")).collect::<Vec<_>>()})),Err(e)=>error(e)};self.reply(id,response);},
    Work::Child(path,effects)=>self.child_effects(path,effects).await?,
    Work::OperatorFetch(id,cid)=>{if self.fetches.contains_key(&id){self.network.retrieve(id,cid).await?;}},
@@ -672,8 +689,7 @@ impl Host {
    Work::Mining(effect)=>match *effect {
     MiningEffect::Preflight(job)=>{
      if job.tip_epoch != self.mining.state().tip_epoch(){continue;}
-     if self.preflights.full(){deferred_preflights.push_back(Work::Mining(Box::new(MiningEffect::Preflight(job))));continue;}
-     if let Some(task)=self.mining.prepare_root_preflight(&job,self.chain.tree())?{self.preflights.start(task);}
+     deferred_preflights.push_back(Work::Mining(Box::new(MiningEffect::Preflight(job))));
     },
     MiningEffect::BuildTemplate(job)=>{
      let anchor=self.chain.tree().difficulty_anchor(&job.tip_cid).map(|a|lattice_validation::DifficultyAnchor{block_height:a.block_height,timestamp:a.timestamp,target:UInt256(a.target)});
@@ -730,6 +746,37 @@ impl Host {
         // worker pool deferred an earlier preflight. Prune that local backlog
         // too; enqueue's pruning can only see self.queue.
         preflight::retain_epoch(&mut deferred_preflights, self.mining.state().tip_epoch());
+        deferred_preflights.retain(|work| match work {
+            Work::ChildMining(path, effect) => match effect.as_ref() {
+                MiningEffect::Preflight(job) => self
+                    .child_mining
+                    .get(path)
+                    .is_some_and(|m| m.core.state().tip_epoch() == job.tip_epoch),
+                _ => true,
+            },
+            _ => true,
+        });
+        // Execute current reducer/connection work before scheduling mining CPU
+        // jobs, as Swift nextJob prefers its execution queue. Preparation is
+        // delayed too, so stale work consumes neither a worker nor a WAL lease.
+        while !self.preflights.full() {
+            let Some(work) = deferred_preflights.pop_front() else {
+                break;
+            };
+            match work {
+                Work::Mining(effect) => {
+                    if let MiningEffect::Preflight(job) = *effect
+                        && let Some(task) = self
+                            .mining
+                            .prepare_root_preflight(&job, self.chain.tree())?
+                    {
+                        self.preflights.start(task);
+                    }
+                }
+                Work::ChildMining(path, effect) => self.child_mining_effect(path, *effect).await?,
+                _ => unreachable!("only preflight work is deferred"),
+            }
+        }
         self.queue.extend(deferred_preflights);
         for scope in std::mem::take(&mut self.transient) {
             self.storage.release_cached_volumes(&scope)?;

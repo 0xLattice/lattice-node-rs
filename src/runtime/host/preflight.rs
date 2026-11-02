@@ -1,11 +1,15 @@
-//! At most four blocking root preflights; actor retains all admission authority.
+//! At most four blocking root/child preflights; actor retains all admission authority.
 use super::*;
 pub(super) fn retain_epoch(queue: &mut VecDeque<Work>, epoch: u64) {
     queue.retain(|work| !matches!(work, Work::Mining(effect) if matches!(effect.as_ref(), MiningEffect::Preflight(job) if job.tip_epoch != epoch)));
 }
+pub(super) enum Completion {
+    Root(RootPreflightCompletion),
+    Child(Vec<String>, ChildPreflightCompletion),
+}
 const MAX_WORKERS: usize = 4;
 pub(super) struct Preflights {
-    jobs: tokio::task::JoinSet<Result<RootPreflightCompletion, crate::storage::StoreError>>,
+    jobs: tokio::task::JoinSet<Result<Completion, crate::storage::StoreError>>,
     width: usize,
 }
 impl Default for Preflights {
@@ -26,13 +30,14 @@ impl Preflights {
         !self.jobs.is_empty()
     }
     pub(super) fn start(&mut self, task: RootPreflightTask) {
-        self.spawn(move || task.run(now()));
+        self.spawn(move || task.run(now()).map(Completion::Root));
+    }
+    pub(super) fn start_child(&mut self, path: Vec<String>, task: ChildPreflightTask) {
+        self.spawn(move || task.run(now()).map(|done| Completion::Child(path, done)));
     }
     fn spawn(
         &mut self,
-        run: impl FnOnce() -> Result<RootPreflightCompletion, crate::storage::StoreError>
-        + Send
-        + 'static,
+        run: impl FnOnce() -> Result<Completion, crate::storage::StoreError> + Send + 'static,
     ) {
         assert!(!self.full());
         // Aborting a JoinSet cannot stop a running blocking task. The task,
@@ -40,7 +45,7 @@ impl Preflights {
         // so cancellation/panic cannot release content under a live reader.
         self.jobs.spawn_blocking(run);
     }
-    pub(super) async fn next(&mut self) -> anyhow::Result<RootPreflightCompletion> {
+    pub(super) async fn next(&mut self) -> anyhow::Result<Completion> {
         Ok(self.jobs.join_next().await.expect("active preflight")??)
     }
 }

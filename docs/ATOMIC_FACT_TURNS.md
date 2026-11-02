@@ -3,6 +3,9 @@
 The runtime now commits these synchronous multi-level operations through one
 journal transaction before processing their queued effects:
 
+- One timer tick across the root and every hosted child, including ready
+  deferred headers, proofs/cursors, descendant run updates, and synchronous
+  mining updates. Subsequent proof-worker completions remain separate events.
 - A mined root header and the carried headers/proofs of all hosted descendants.
 - A root execution result, descendant wakes, and synchronous mining updates.
 - A child execution result, descendant wakes, local proof completions, and
@@ -64,3 +67,9 @@ checks two real root grinds and rolls both back if the later proof write fails.
 The child-author daemon harness injects a proof-store failure after an independent
 parent commitment, checks 503/fail-stop/no child journal, and recovers the root
 commitment before retrying the child successfully.
+
+The tick regression authenticates future-dated headers before their admission
+window, then admits one root header and two hosted child successors on one tick.
+An injected later-child proof failure rolls back all three headers and the root
+stream cursor; restoration sees the previous facts. The success case restores
+all three. Header receipt remains on its existing admission implementation.

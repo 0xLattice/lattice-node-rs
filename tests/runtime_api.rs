@@ -10,6 +10,9 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct Backend(AtomicUsize);
 impl RpcBackend for Backend {
+    fn metrics(&self) -> Option<String> {
+        Some("sample_metric 7\n".into())
+    }
     fn health(&self, route: String) -> RpcFuture {
         Box::pin(async move { Ok((200, json!({"route":route}))) })
     }
@@ -77,6 +80,8 @@ async fn real_http_cookie_origins_methods_and_payload_bounds() {
     for (method, path, headers, body, status) in [
         ("GET", "/health", "", "", 200),
         ("GET", "/status", "", "", 401),
+        ("GET", "/metrics", "", "", 401),
+        ("POST", "/metrics", auth.as_str(), "", 405),
         ("GET", "/status", auth.as_str(), "", 200),
         ("GET", "/hosted-chains", auth.as_str(), "", 200),
         ("GET", "/hosted-chains", "", "", 401),
@@ -119,6 +124,16 @@ async fn real_http_cookie_origins_methods_and_payload_bounds() {
             "{method} {path}: {result}"
         );
     }
+    let scrape = call(addr, &request("GET", "/metrics", &auth, "")).await;
+    assert!(scrape.starts_with("HTTP/1.1 200"));
+    assert!(scrape.contains("content-type: text/plain; version=0.0.4"));
+    assert_eq!(
+        scrape.split_once("\r\n\r\n").unwrap().1,
+        "sample_metric 7\n"
+    );
+    let head = call(addr, &request("HEAD", "/metrics", &auth, "")).await;
+    assert!(head.starts_with("HTTP/1.1 200"));
+    assert_eq!(head.split_once("\r\n\r\n").unwrap().1, "");
     let bearer = format!(
         "Authorization: Bearer {}\r\n",
         token.strip_prefix("__cookie__:").unwrap()

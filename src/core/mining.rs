@@ -802,18 +802,18 @@ pub struct RootPreflightTask {
     snapshot: lattice_volume_broker::DiskReadSnapshot,
     _storage: std::sync::Arc<crate::storage::NodeStorage>,
 }
+struct SnapshotSource<'a>(&'a lattice_volume_broker::DiskReadSnapshot);
+impl lattice_cashew::ContentSource for SnapshotSource<'_> {
+    fn fetch(&self, cid: &str) -> Result<Vec<u8>, lattice_cashew::Error> {
+        self.0
+            .fetch_data(&[cid.to_owned()].into_iter().collect())
+            .ok()
+            .and_then(|mut rows| rows.remove(cid))
+            .ok_or_else(|| lattice_cashew::Error::MissingContent(cid.into()))
+    }
+}
 impl RootPreflightTask {
     pub fn run(self, now: i64) -> Result<RootPreflightCompletion, crate::storage::StoreError> {
-        struct Source<'a>(&'a lattice_volume_broker::DiskReadSnapshot);
-        impl lattice_cashew::ContentSource for Source<'_> {
-            fn fetch(&self, cid: &str) -> Result<Vec<u8>, lattice_cashew::Error> {
-                self.0
-                    .fetch_data(&[cid.to_owned()].into_iter().collect())
-                    .ok()
-                    .and_then(|mut rows| rows.remove(cid))
-                    .ok_or_else(|| lattice_cashew::Error::MissingContent(cid.into()))
-            }
-        }
         let tip = lattice_cashew::Volume(lattice_cashew::Header::from_cid(&self.job.tip_cid)?);
         let result = lattice_validation::TransactionPreflight {
             transaction: &self.job.transaction,
@@ -823,7 +823,7 @@ impl RootPreflightTask {
             now_milliseconds: now,
             checks_policies: self.job.checks_policies,
         }
-        .classify(&Source(&self.snapshot))?;
+        .classify(&SnapshotSource(&self.snapshot))?;
         Ok(RootPreflightCompletion {
             job: self.job,
             result,
@@ -954,4 +954,4 @@ impl DurableMiningCore {
 
 #[path = "mining_child.rs"]
 mod child;
-pub use child::ChildPreflightCompletion;
+pub use child::{ChildPreflightCompletion, ChildPreflightTask};

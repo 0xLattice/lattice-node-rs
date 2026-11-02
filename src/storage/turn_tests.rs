@@ -731,3 +731,192 @@ fn one_derived_result_rolls_back_every_verified_grind_on_later_proof_failure() {
         }
     }
 }
+
+#[test]
+fn tick_rolls_back_authenticated_ready_headers_at_every_level() {
+    use crate::core::{
+        levels::ChildChainCore,
+        stream::StreamConfig,
+        sync::{HeaderEntry, HeadersResponse, LogEntry, PeerId, StreamEntry, StreamPage},
+    };
+    for fail in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let (storage, parent, _, root_genesis, carrier, _) = fixture(directory.path());
+        let verified = lattice_validation::validate_root_genesis(
+            &Volume::new(root_genesis.clone()).unwrap(),
+            &BTreeMap::<String, Vec<u8>>::new(),
+            i64::MAX,
+        )
+        .unwrap();
+        let mut root = crate::core::chain::RootChainCore::open(
+            storage.clone(),
+            &verified,
+            "atomic",
+            StreamConfig::default(),
+            8,
+        )
+        .unwrap();
+        let mut future_root = carrier.clone();
+        future_root.timestamp = 5000;
+        let root_cid = content_id(&future_root).unwrap();
+        let peer = PeerId {
+            key: "tick-peer".into(),
+            session: 1,
+        };
+        root.peer_ready(peer.clone(), 3000);
+        let request_id = root.sync().peers[&peer].stream.as_ref().unwrap().request_id;
+        root.stream_page(
+            &peer,
+            StreamPage {
+                request_id,
+                log_id: "remote".into(),
+                has_more: false,
+                entries: vec![StreamEntry {
+                    position: 1,
+                    entry: LogEntry::header(&root_cid),
+                }],
+            },
+            3000,
+        )
+        .unwrap();
+        let request_id = root.sync().peers[&peer].data.as_ref().unwrap().request_id;
+        root.received_headers(
+            &peer,
+            HeadersResponse {
+                request_id,
+                has_more: false,
+                entries: vec![HeaderEntry {
+                    block: future_root.clone(),
+                    children: future_root.children.node.as_deref().cloned(),
+                    spec: None,
+                    proofs: vec![],
+                }],
+            },
+            3000,
+        )
+        .unwrap();
+        assert!(!root.tree().contains(&root_cid));
+        let mut cores = vec![];
+        let mut children = vec![];
+        for name in ["Alpha", "Beta"] {
+            let path = vec!["Nexus".into(), name.into()];
+            let mut parent = parent.clone();
+            parent.serve_runs(name);
+            let mut core = ChildChainCore::open(
+                storage.clone(),
+                ChainRuntimeContext::new(path.clone(), None).unwrap(),
+                &parent,
+                vec![],
+                "atomic",
+                StreamConfig::default(),
+                8,
+            )
+            .unwrap();
+            let mut genesis = funded(&["Nexus", name]);
+            genesis.parent_state = carrier.prev_state.clone();
+            let mut future = genesis.clone();
+            future.parent = Some(Volume::new(genesis.clone()).unwrap());
+            future.prev_state = genesis.post_state.clone();
+            future.height = 1;
+            future.timestamp = 5000;
+            for block in [&genesis, &future] {
+                let mut carrier = carrier.clone();
+                carrier.children = Header::new(BTreeMap::from([(
+                    name.to_owned(),
+                    Volume::new(block.clone()).unwrap(),
+                )]))
+                .unwrap();
+                storage
+                    .cache_volumes(
+                        "tick-fixture",
+                        &lattice_cashew::volume::serialize_recursive(
+                            &Volume::new(carrier.clone()).unwrap(),
+                            &(),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                let proof = ChildBlockProof::generate(
+                    &content_id(&carrier).unwrap(),
+                    name,
+                    storage.as_ref(),
+                )
+                .unwrap();
+                core.queue_header(
+                    HeaderEntry {
+                        block: block.clone(),
+                        children: block.children.node.as_deref().cloned(),
+                        spec: block.spec.0.node.as_deref().cloned(),
+                        proofs: vec![proof],
+                    },
+                    None,
+                    None,
+                    3000,
+                )
+                .unwrap();
+                let completion = core.proof_work().checks.remove(0).run(None);
+                storage
+                    .fact_turn_or_join(|| core.proof_completed(completion, 3000))
+                    .unwrap();
+            }
+            let cid = content_id(&future).unwrap();
+            assert!(!core.tree().contains(&cid), "future header must await tick");
+            assert!(core.tree().contains(&content_id(&genesis).unwrap()));
+            children.push((path, cid, parent));
+            cores.push(core);
+        }
+        if fail {
+            storage.journal().db.lock().unwrap().execute_batch(&format!(
+                "CREATE TEMP TRIGGER fail_tick BEFORE INSERT ON child_proofs WHEN NEW.child='{}' BEGIN SELECT RAISE(ABORT,'later level'); END", children[1].1)).unwrap();
+        }
+        let result = storage.atomic_fact_turn(|| -> Result<(), StoreError> {
+            root.tick(6000)?;
+            for core in &mut cores {
+                core.tick(6000)?;
+            }
+            Ok(())
+        });
+        assert_eq!(result.is_ok(), !fail, "{result:?}");
+        drop(cores);
+        drop(root);
+        assert_eq!(
+            storage.journal().header(&root_cid).unwrap().is_some(),
+            !fail
+        );
+        let root = crate::core::chain::RootChainCore::open(
+            storage.clone(),
+            &verified,
+            "atomic",
+            StreamConfig::default(),
+            8,
+        )
+        .unwrap();
+        assert_eq!(root.tree().contains(&root_cid), !fail);
+        assert_eq!(
+            root.sync().cursors[&peer.key].position,
+            if fail { 0 } else { 1 }
+        );
+        for (path, cid, parent) in children {
+            assert_eq!(storage.journal().header(&cid).unwrap().is_some(), !fail);
+            assert_eq!(
+                !storage
+                    .journal()
+                    .saved_proofs(&path, std::slice::from_ref(&cid))
+                    .unwrap()
+                    .is_empty(),
+                !fail
+            );
+            let restored = ChildChainCore::open(
+                storage.clone(),
+                ChainRuntimeContext::new(path, None).unwrap(),
+                &parent,
+                vec![],
+                "atomic",
+                StreamConfig::default(),
+                8,
+            )
+            .unwrap();
+            assert_eq!(restored.tree().contains(&cid), !fail);
+        }
+    }
+}

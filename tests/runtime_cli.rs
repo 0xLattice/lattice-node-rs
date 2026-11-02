@@ -53,6 +53,19 @@ fn rpc(address: &str, path: &str, body: Option<Value>, cookie: &str) -> (u16, Va
         serde_json::from_str(body).unwrap(),
     )
 }
+fn metrics(address: &str, cookie: &str) -> String {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(stream, "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: Basic {}\r\n\r\n", STANDARD.encode(cookie)).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("content-type: text/plain; version=0.0.4"));
+    response.split_once("\r\n\r\n").unwrap().1.to_owned()
+}
 fn stop(process: &mut Process) {
     assert!(
         Command::new("kill")
@@ -112,6 +125,11 @@ fn actual_process_rpc_mine_shutdown_and_durable_restart() {
     let (code, status) = rpc(address, "/status", None, &cookie);
     assert_eq!(code, 200);
     assert_eq!(status["height"], "0");
+    let initial_metrics = metrics(address, &cookie);
+    assert!(
+        initial_metrics.contains("lattice_chain_tip_height{chain=\"Nexus\",tier=\"validated\"} 0")
+    );
+    assert!(initial_metrics.contains("lattice_overlay_peers{chain=\"Nexus\"} 0"));
     let (code, template) = rpc(
         address,
         "/mining/templates",
@@ -129,6 +147,18 @@ fn actual_process_rpc_mine_shutdown_and_durable_restart() {
     let (_, status) = rpc(address, "/status", None, &cookie);
     assert_eq!(status["height"], "1");
     let tip = status["tipCID"].clone();
+    let mined_metrics = metrics(address, &cookie);
+    assert!(
+        mined_metrics.contains("lattice_chain_tip_height{chain=\"Nexus\",tier=\"validated\"} 1")
+    );
+    assert_eq!(
+        initial_metrics
+            .lines()
+            .find(|s| s.starts_with("process_start_time_seconds{")),
+        mined_metrics
+            .lines()
+            .find(|s| s.starts_with("process_start_time_seconds{"))
+    );
     stop(&mut process);
     assert!(!cookie_path.exists());
     value["bootstrapFiles"] = json!([]);

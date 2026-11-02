@@ -391,10 +391,10 @@ Child seeds follow remembered/provider stages and the peer threshold; successful
 dials populate ancestry books. A four-host restart test verifies seed-update
 suppression, child-book retention, remembered-peer priority, fallback and isolation.
 
-### Asynchronous root transaction preflight
+### Asynchronous root and child transaction preflight
 
-Root transaction preflight now captures its executed-tip/epoch authority on the
-actor and executes on at most four blocking workers (also capped by available
+Root and child transaction preflight capture their executed-tip/epoch authority on the
+actor and executes on a shared pool of at most four blocking workers (also capped by available
 parallelism). The private-input task alone produces the authenticated completion;
 the actor rechecks its epoch and immutable context before durable pool admission.
 Queued old-epoch jobs are removed, including A-to-B-to-A changes. When workers are
@@ -423,9 +423,18 @@ then verifies cancellation retains ownership until the workers actually exit.
 VolumeBroker's real WAL test deletes old content and inserts new content on a
 concurrent writer: the old snapshot retains only its original view, and a fresh
 snapshot sees the deletion. Existing real host and daemon mining/restart tests
-also pass. This ports the root preflight worker boundary from pinned Swift
-`NodeRuntime.swift`'s mining-job queue; root transitions, template building and
-child preflights remain separate scheduling work, not claimed asynchronous parity.
+also pass. Child tasks additionally capture the parent's executed state and
+revision. A same-child-epoch completion whose parent revision changed requeues
+its original job against a fresh basis, preserving the pending admission instead
+of stranding it. `tests/child_preflight.rs` verifies this with real executed
+parent/child graphs, an intervening header-only parent update, and detached
+validation; it also rejects an A-to-B-to-A child epoch completion. Root and child
+jobs share one capacity limit; queued execution work drains before either kind
+starts, and stale child jobs are pruned before preparation. This ports the
+preflight worker boundary from pinned Swift `NodeRuntime.swift` and
+`NodeRuntime+API.swift`'s mining-job queue. Root transitions, template building,
+and proof batches remain separate scheduling work; full asynchronous executor
+parity is not claimed.
 
 ### Explicit peer reconnect wiring
 

@@ -8,6 +8,37 @@ pub struct ChildPreflightCompletion {
     parent_tip: String,
     result: lattice_validation::TransactionPreflightResult,
 }
+/// Captured on the actor; worker owns both content snapshot and directory lease.
+pub struct ChildPreflightTask {
+    job: PreflightJob,
+    path: Vec<String>,
+    parent_revision: u64,
+    parent_tip: String,
+    parent_state: Option<lattice_primitives::LatticeStateHeader>,
+    snapshot: lattice_volume_broker::DiskReadSnapshot,
+    _storage: std::sync::Arc<crate::storage::NodeStorage>,
+}
+impl ChildPreflightTask {
+    pub fn run(self, now: i64) -> Result<ChildPreflightCompletion, crate::storage::StoreError> {
+        let tip = lattice_cashew::Volume(lattice_cashew::Header::from_cid(&self.job.tip_cid)?);
+        let result = lattice_validation::TransactionPreflight {
+            transaction: &self.job.transaction,
+            tip: &tip,
+            chain_path: &self.path,
+            parent_state: self.parent_state.as_ref(),
+            now_milliseconds: now,
+            checks_policies: self.job.checks_policies,
+        }
+        .classify(&SnapshotSource(&self.snapshot))?;
+        Ok(ChildPreflightCompletion {
+            job: self.job,
+            path: self.path,
+            parent_revision: self.parent_revision,
+            parent_tip: self.parent_tip,
+            result,
+        })
+    }
+}
 impl DurableMiningCore {
     pub fn execute_child_preflight(
         &self,
@@ -16,6 +47,16 @@ impl DurableMiningCore {
         parent: &lattice_block_tree::ChainTree,
         now: i64,
     ) -> Result<Option<ChildPreflightCompletion>, crate::storage::StoreError> {
+        self.prepare_child_preflight(job, tree, parent)?
+            .map(|task| task.run(now))
+            .transpose()
+    }
+    pub fn prepare_child_preflight(
+        &self,
+        job: &PreflightJob,
+        tree: &lattice_block_tree::ChainTree,
+        parent: &lattice_block_tree::ChainTree,
+    ) -> Result<Option<ChildPreflightTask>, crate::storage::StoreError> {
         let Some(context) = tree.context().filter(|c| !c.is_root()) else {
             return Ok(None);
         };
@@ -40,22 +81,14 @@ impl DurableMiningCore {
         } else {
             None
         };
-        let tip = lattice_cashew::Volume(lattice_cashew::Header::from_cid(&job.tip_cid)?);
-        let result = lattice_validation::TransactionPreflight {
-            transaction: &job.transaction,
-            tip: &tip,
-            chain_path: context.path(),
-            parent_state: parent_state.as_ref(),
-            now_milliseconds: now,
-            checks_policies: job.checks_policies,
-        }
-        .classify(self.storage.as_ref())?;
-        Ok(Some(ChildPreflightCompletion {
+        Ok(Some(ChildPreflightTask {
             job: job.clone(),
             path: context.path().to_vec(),
             parent_revision: parent.current_revision(),
             parent_tip,
-            result,
+            parent_state,
+            snapshot: self.storage.preflight_snapshot()?,
+            _storage: self.storage.clone(),
         }))
     }
     pub fn complete_child_preflight(
@@ -73,8 +106,6 @@ impl DurableMiningCore {
         } = completion;
         if job.tip_epoch != self.state.tip_epoch
             || job.tip_cid != self.state.tip_cid
-            || parent.current_revision() != parent_revision
-            || parent.heaviest_executed_tip(&BTreeSet::new()) != parent_tip
             || parent
                 .context()
                 .is_none_or(|p| p.path() != &path[..path.len() - 1])
@@ -84,6 +115,14 @@ impl DurableMiningCore {
             || result.checks_policies() != job.checks_policies
         {
             return Ok(vec![]);
+        }
+        if parent.current_revision() != parent_revision
+            || parent.heaviest_executed_tip(&BTreeSet::new()) != parent_tip
+        {
+            // The child epoch can stay unchanged when only the parent's graph
+            // revision moves. Keep the admission/slot and rerun with a fresh
+            // parent basis, rather than losing the sole outstanding result.
+            return Ok(vec![MiningEffect::Preflight(job)]);
         }
         let disposition = match result.disposition() {
             lattice_validation::PreflightDisposition::Ready => MempoolDisposition::Ready,

@@ -109,7 +109,11 @@ impl Host {
         }
         Ok(())
     }
-    fn enqueue_child_mining(&mut self, path: &[String], effects: Vec<MiningEffect>) {
+    pub(super) fn enqueue_child_mining(&mut self, path: &[String], effects: Vec<MiningEffect>) {
+        if let Some(mining) = self.child_mining.get(path) {
+            let epoch = mining.core.state().tip_epoch();
+            self.queue.retain(|work| !matches!(work, Work::ChildMining(queued_path,effect) if queued_path == path && matches!(effect.as_ref(), MiningEffect::Preflight(job) if job.tip_epoch != epoch)));
+        }
         self.queue.extend(
             effects
                 .into_iter()
@@ -153,13 +157,8 @@ impl Host {
                 let parent = self.child_parent(&path)?;
                 let tree = self.levels.get(&path).unwrap().tree();
                 let mining = self.child_mining.get_mut(&path).unwrap();
-                if let Some(done) =
-                    mining
-                        .core
-                        .execute_child_preflight(&job, tree, &parent, now())?
-                {
-                    let effects = mining.core.complete_child_preflight(done, &parent, now())?;
-                    self.enqueue_child_mining(&path, effects);
+                if let Some(task) = mining.core.prepare_child_preflight(&job, tree, &parent)? {
+                    self.preflights.start_child(path, task);
                 }
             }
             MiningEffect::TransactionAdmitted {

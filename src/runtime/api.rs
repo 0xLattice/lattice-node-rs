@@ -29,6 +29,10 @@ pub trait RpcBackend: Send + Sync + 'static {
     fn health(&self, _route: String) -> RpcFuture {
         Box::pin(async { Ok((503, json!({"error":"health snapshot unavailable"}))) })
     }
+    /// Independent Prometheus snapshot; operator listener only.
+    fn metrics(&self) -> Option<String> {
+        None
+    }
     fn remote_volume(&self, _cid: String) -> VolumeFuture {
         Box::pin(async { Ok(None) })
     }
@@ -212,7 +216,7 @@ pub(super) async fn serve_with_submit(
     let method = request.method().clone();
     let expected = match path.as_str() {
         "/hosted-chains" if method == Method::POST => Method::POST,
-        "/status" | "/hosted-chains" => Method::GET,
+        "/status" | "/hosted-chains" | "/metrics" => Method::GET,
         path if path.starts_with("/api/")
             || path.starts_with("/accounts/")
             || path.starts_with("/transactions/") =>
@@ -249,6 +253,26 @@ pub(super) async fn serve_with_submit(
     let Ok(_permit) = slots.try_acquire() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "RPC busy");
     };
+    if path == "/metrics" {
+        return match backend.metrics() {
+            Some(text) => {
+                let mut response = Response::new(if method == Method::HEAD {
+                    Body::empty()
+                } else {
+                    Body::from(text)
+                });
+                response.headers_mut().insert(
+                    "content-type",
+                    HeaderValue::from_static(super::metrics::CONTENT_TYPE),
+                );
+                response
+            }
+            None => error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "metrics snapshot unavailable",
+            ),
+        };
+    }
     if let Some(cid) = path.strip_prefix("/volumes/") {
         if lattice_cashew::canonical_cid(cid).is_err() {
             return error(StatusCode::BAD_REQUEST, "invalidCID");

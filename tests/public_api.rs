@@ -160,6 +160,8 @@ async fn public_allowlist_cors_budgets_and_coalesced_health() {
         ("POST", "/pins"),
         ("GET", "/pins"),
         ("GET", "/status"),
+        ("GET", "/metrics"),
+        ("HEAD", "/metrics"),
         ("POST", "/sweep"),
         ("GET", "/fetch/x"),
         ("GET", "/hosted-chains"),

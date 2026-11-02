@@ -79,6 +79,13 @@ impl RootChainCore {
         self.headers.declined = DeclinedSet::default();
         self.headers.refresh_finality(&self.tree);
     }
+    pub(crate) fn body_distances(&self) -> std::collections::BTreeMap<String, usize> {
+        super::body::body_window(&self.tree, self.body_window)
+            .into_iter()
+            .enumerate()
+            .map(|(n, cid)| (cid, n))
+            .collect()
+    }
     pub(crate) fn acquisition_frontier(&self) -> std::collections::BTreeSet<String> {
         super::body::next_to_connect(&self.tree, self.body_window)
             .into_iter()

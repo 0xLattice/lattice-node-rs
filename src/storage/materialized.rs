@@ -10,6 +10,7 @@ pub struct NodeStorage {
     pub(super) broker: DiskBroker,
     scope: String,
     retention: RetentionPolicy,
+    bundles: super::bundles::BundleCache,
     pub(super) turn: turn::TurnGate,
     pub(super) turn_releases: Mutex<Option<Vec<(String, Roots)>>>,
     pub(super) turn_failed: std::sync::atomic::AtomicBool,
@@ -48,6 +49,7 @@ impl NodeStorage {
             store.forget_state_counts()?;
         }
         Ok(Self {
+            bundles: super::bundles::BundleCache::open(directory),
             retention,
             store,
             broker,
@@ -248,15 +250,28 @@ impl NodeStorage {
             .filter(|bytes| lattice_cashew::validate_entry(root, bytes).is_ok())
             .map(|bytes| SerializedVolume::new(root, BTreeMap::from([(root.into(), bytes)]))))
     }
-    pub fn serving_bundle(&self, root: &str) -> Result<Vec<String>, StoreError> {
-        for import in self.store.staged_imports(None)?.into_iter().rev() {
-            if import.volume_roots.iter().any(|r| r == root) {
-                let mut roots = vec![root.into()];
-                roots.extend(import.volume_roots.into_iter().filter(|r| r != root));
-                return Ok(roots);
-            }
+    /// Called from storage-owning workers while their source lease is live.
+    /// Failure only loses an optimization; no cache row is an admission fact.
+    pub(crate) fn record_serving_bundle(
+        &self,
+        root: &str,
+        source: &impl lattice_cashew::ContentSource,
+    ) {
+        if let Ok(roots) = super::bundles::walk(root, source) {
+            self.bundles.put(root, &roots);
         }
-        Ok(vec![root.into()])
+    }
+    pub fn serving_bundle(&self, root: &str) -> Result<Vec<String>, StoreError> {
+        if let Some(roots) = self.bundles.get(root) {
+            return Ok(roots);
+        }
+        // Walk locally only. Incomplete/non-block content advertises itself;
+        // never cache a failed walk so later local arrivals can complete it.
+        let Ok(roots) = super::bundles::walk(root, self) else {
+            return Ok(vec![root.into()]);
+        };
+        self.bundles.put(root, &roots);
+        Ok(roots)
     }
 }
 

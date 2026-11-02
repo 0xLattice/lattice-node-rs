@@ -8,11 +8,8 @@ mod websocket;
 use super::acquisition::{Priority, Queue, Reservation, ResourcePolicy, SESSION_BYTES};
 use super::handshake::{ChainHandshake, HELLO};
 use crate::{core::sync::PeerId, storage::NodeStorage};
-use ivy_core::core::{
-    AuthenticatedPeer, ContentJob, ContentJobResult, CoreSettings, Effect, Event, Request,
-    RequestResult,
-};
-use ivy_core::{Config, ContentEntry, Message, PeerEndpoint};
+use ivy_core::core::{AuthenticatedPeer, CoreSettings, Effect, Event, Request, RequestResult};
+use ivy_core::{Config, Message, PeerEndpoint};
 use lattice_cashew::SerializedVolume;
 pub use read_endpoints::ReadEndpointConfig;
 use std::{
@@ -60,7 +57,7 @@ pub enum NetworkEvent {
     Closed(PeerId),
     Message(PeerId, String, Vec<u8>),
     Sent(u64, bool),
-    Fetched(u64, Option<Vec<SerializedVolume>>, Option<Reservation>),
+    Fetched(u64, Option<Vec<SerializedVolume>>, Option<Arc<Reservation>>),
     FetchBusy(u64),
 }
 struct Session {
@@ -98,15 +95,15 @@ enum Pending {
     Fetch {
         tag: u64,
         root: String,
-        reservation: Reservation,
+        reservation: Option<Arc<Reservation>>,
     },
     Retrieve {
         tag: u64,
         root: String,
-        reservation: Reservation,
+        reservation: Option<Arc<Reservation>>,
     },
     CancelledAcquisition {
-        _reservation: Reservation,
+        _reservation: Option<Arc<Reservation>>,
     },
     Discover {
         path: Vec<String>,
@@ -116,6 +113,9 @@ enum Pending {
     },
 }
 enum Acquisition {
+    Reserve {
+        tag: u64,
+    },
     Fetch {
         tag: u64,
         root: String,
@@ -130,11 +130,12 @@ enum Acquisition {
 impl Acquisition {
     fn tag(&self) -> u64 {
         match self {
-            Self::Fetch { tag, .. } | Self::Retrieve { tag, .. } => *tag,
+            Self::Reserve { tag } | Self::Fetch { tag, .. } | Self::Retrieve { tag, .. } => *tag,
         }
     }
 }
 pub struct Network {
+    content_jobs: super::content_jobs::ContentJobs,
     acquisitions: Queue<Acquisition>,
     websocket: Option<websocket::Running>,
     pub websocket_address: Option<SocketAddr>,
@@ -262,7 +263,7 @@ impl Network {
         let (shutdown, shutdown_requested) = oneshot::channel();
         let (streams, supplied) = mpsc::channel(16);
         let websocket = browser.map(|listener| listener.start(streams));
-        let task = tokio::spawn(ivy::node::run_with_shutdown(
+        let task = tokio::spawn(ivy::punch_node::run_application_with_shutdown(
             listener,
             config,
             settings,
@@ -276,6 +277,10 @@ impl Network {
         ));
         commands.send(Event::SetContentSource(true)).await?;
         Ok(Self {
+            content_jobs: super::content_jobs::ContentJobs::new(
+                storage.clone(),
+                overlay.resources.serving_max_concurrent,
+            ),
             acquisitions: Queue::new(overlay.resources.max_acquisition_bytes),
             websocket,
             websocket_address,
@@ -510,6 +515,47 @@ impl Network {
         );
         Ok(())
     }
+    /// A dependency fetch within a worker's already reserved acquisition session.
+    pub(crate) async fn fetch_reserved(
+        &mut self,
+        tag: u64,
+        root: String,
+        reservation: Arc<Reservation>,
+    ) -> anyhow::Result<()> {
+        let peers = self
+            .sessions
+            .values()
+            .filter(|s| s.ready)
+            .map(|s| s.peer.clone())
+            .collect::<Vec<_>>();
+        if peers.is_empty() {
+            self.events
+                .push_back(NetworkEvent::Fetched(tag, None, None));
+            return Ok(());
+        }
+        self.request(
+            Request::FetchFromSessions {
+                root_cid: root.clone(),
+                bundle: false,
+                peers,
+                maximum_archive_bytes: SESSION_BYTES,
+                maximum_entries: u16::MAX,
+            },
+            Some(Pending::Fetch {
+                tag,
+                root,
+                reservation: Some(reservation),
+            }),
+        )
+        .await
+    }
+    pub(crate) fn reserve_worker(&mut self, tag: u64) {
+        self.acquisitions.push(
+            SESSION_BYTES,
+            Priority::OwnWork,
+            Acquisition::Reserve { tag },
+        );
+    }
     pub async fn fetch_body(
         &mut self,
         tag: u64,
@@ -559,6 +605,11 @@ impl Network {
                 break;
             };
             match request {
+                Acquisition::Reserve { tag } => self.events.push_back(NetworkEvent::Fetched(
+                    tag,
+                    Some(vec![]),
+                    Some(Arc::new(reservation)),
+                )),
                 Acquisition::Retrieve { tag, root } => {
                     self.request(
                         Request::RetrieveVolume {
@@ -569,7 +620,7 @@ impl Network {
                         Some(Pending::Retrieve {
                             tag,
                             root,
-                            reservation,
+                            reservation: Some(Arc::new(reservation)),
                         }),
                     )
                     .await?;
@@ -608,7 +659,7 @@ impl Network {
                         Some(Pending::Fetch {
                             tag,
                             root,
-                            reservation,
+                            reservation: Some(Arc::new(reservation)),
                         }),
                     )
                     .await?;
@@ -746,11 +797,17 @@ impl Network {
             // effects while waiting for command capacity to avoid a cycle.
             // Pop only after reservation: cancellation leaves commands queued.
             let wake = self.acquisitions.wakeup();
+            let mut job_finished = None;
             let incoming = tokio::select! {
                 _=wake.notified()=>continue,
+                done=self.content_jobs.next()=>{ job_finished = Some(done); None },
                 permit=self.commands.reserve(), if !self.outbound.is_empty()=>{permit?.send(self.outbound.pop_front().unwrap());continue},
                 effect=self.effects.recv()=>effect,
             };
+            if let Some((id, result)) = job_finished {
+                self.emit(Event::JobFinished(id, result))?;
+                continue;
+            }
             let Some(effect) = incoming else {
                 return Ok(None);
             };
@@ -1010,49 +1067,20 @@ impl Network {
                                 self.events.push_back(NetworkEvent::Fetched(
                                     tag,
                                     volumes,
-                                    Some(reservation),
+                                    reservation,
                                 ));
                             }
                         }
                     }
                 }
-                Effect::StartJob(id, job) => {
-                    let result = match job {
-                        ContentJob::AuthorizeVolume { .. } => ContentJobResult::Authorized(true),
-                        ContentJob::ReadVolume {
-                            root_cid,
-                            max_data_bytes,
-                        } => {
-                            let volume = self.storage.serving_volume(&root_cid)?;
-                            let entries = volume
-                                .filter(|v| {
-                                    v.entries
-                                        .values()
-                                        .try_fold(0usize, |sum, v| sum.checked_add(v.len()))
-                                        .is_some_and(|n| n <= max_data_bytes)
-                                })
-                                .map(|v| {
-                                    v.entries
-                                        .into_iter()
-                                        .map(|(cid, data)| ContentEntry { cid, data })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            ContentJobResult::Entries(entries)
-                        }
-                        ContentJob::ReadBundle { root_cid } => {
-                            ContentJobResult::Roots(self.storage.serving_bundle(&root_cid)?)
-                        }
-                    };
-                    self.emit(Event::JobFinished(id, result))?;
-                }
-                // Jobs complete synchronously above, so cancellation has no remaining task.
-                Effect::CancelJob(_) => {}
+                Effect::StartJob(id, job) => self.content_jobs.submit(id, job),
+                Effect::CancelJob(id) => self.content_jobs.cancel(id),
                 _ => {}
             }
         }
     }
     pub async fn stop(&mut self) {
+        self.content_jobs.shutdown().await;
         if let Some(mut websocket) = self.websocket.take() {
             websocket.stop().await;
         }
@@ -1361,7 +1389,7 @@ mod tests {
         network.pending.insert(
             99,
             Pending::Fetch {
-                reservation,
+                reservation: Some(Arc::new(reservation)),
                 tag: 99,
                 root: "root".into(),
             },

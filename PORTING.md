@@ -564,3 +564,9 @@ also reopens Tip/None stores with All retention and verifies migration to chain
 ownership precedes old-scope cleanup. These delayed candidate cases exercise the
 real storage persistence hook; they do not replace authenticated child protocol
 tests or claim a new formal proof of retention.
+
+Serving storage jobs now use bounded cancellable workers. Block bundles use an
+optional block-root cache and exact local selected-content traversal instead of
+scanning admission history. See [serving jobs and bundle validation](docs/SERVING_JOBS.md)
+for worker lifetime, pruning/cache behavior, actual pinned Swift comparisons and
+real authenticated localhost transfer coverage.

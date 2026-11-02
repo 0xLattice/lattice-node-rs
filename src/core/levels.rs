@@ -147,6 +147,13 @@ impl ChildChainCore {
                     super::finality::past(&self.tree, height, self.header_config.finality)
                 }))
     }
+    pub(crate) fn body_distances(&self) -> BTreeMap<String, usize> {
+        super::body::body_window(&self.tree, self.body_window)
+            .into_iter()
+            .enumerate()
+            .map(|(n, cid)| (cid, n))
+            .collect()
+    }
     pub(crate) fn acquisition_frontier(&self) -> std::collections::BTreeSet<String> {
         super::body::next_to_connect(&self.tree, self.body_window)
             .into_iter()
@@ -352,6 +359,16 @@ impl ChildChainCore {
             )?
         };
         self.published(admitted, now)
+    }
+    pub(crate) fn wanted_bodies(&self) -> BTreeSet<String> {
+        let mut wanted: BTreeSet<_> = super::body::body_window(&self.tree, self.body_window)
+            .into_iter()
+            .collect();
+        wanted.extend(self.bodies.connecting.iter().cloned());
+        wanted
+    }
+    pub(crate) fn owns_connection(&self, cid: &str) -> bool {
+        self.bodies.connecting.as_deref() == Some(cid)
     }
     fn connecting(&self, cid: &str) -> Result<(), StoreError> {
         if self.bodies.connecting.as_deref() != Some(cid) {
@@ -572,16 +589,48 @@ impl HostedLevels {
     }
 }
 
+pub(crate) struct ChildExecutionTask {
+    tree: ChainTree,
+    parent: ChainTree,
+    job: lattice_block_tree::ConnectJob,
+    proof: ChildBlockProof,
+}
+pub(crate) struct ChildExecutionCompletion {
+    task: ChildExecutionTask,
+    result: lattice_block_tree::ChildConnectionExecution,
+}
+impl ChildExecutionTask {
+    pub(crate) fn run(
+        self,
+        source: &impl lattice_cashew::ContentSource,
+        now: i64,
+    ) -> Result<ChildExecutionCompletion, StoreError> {
+        let result = self.tree.execute_child_connection(
+            &self.job,
+            &self.parent,
+            &self.proof,
+            source,
+            now,
+        )?;
+        Ok(ChildExecutionCompletion { task: self, result })
+    }
+}
+impl ChildExecutionCompletion {
+    pub(crate) fn header(&self) -> Option<&lattice_primitives::BlockHeader> {
+        match &self.result {
+            lattice_block_tree::ChildConnectionExecution::Genesis(v) => Some(v.header()),
+            lattice_block_tree::ChildConnectionExecution::Transition(v) => Some(v.header()),
+            _ => None,
+        }
+    }
+}
 impl ChildChainCore {
-    /// Synchronous worker adapter over the current executed parent graph. The
-    /// returned effects remain behind the same durable barrier as root work.
-    pub fn run_connection(
+    pub(crate) fn prepare_connection(
         &mut self,
         job: &lattice_block_tree::ConnectJob,
         parent: &ChainTree,
         now: i64,
-    ) -> Result<ChainEffects, StoreError> {
-        use lattice_block_tree::ChildConnectionExecution;
+    ) -> Result<(Option<ChildExecutionTask>, ChainEffects), StoreError> {
         self.connecting(job.block_hash())?;
         let path = self.tree.context().unwrap().path().to_vec();
         let mut saved = self
@@ -603,38 +652,97 @@ impl ChildChainCore {
             );
             self.proofs.require_proof(job.block_hash().into());
             self.evidence_changed(&[job.block_hash().into()]);
-            return Ok(self.finish(SyncTurn::default(), now));
+            return Ok((None, self.finish(SyncTurn::default(), now)));
         };
-        match self
-            .tree
-            .execute_child_connection(job, parent, &proof, self.storage.as_ref(), now)?
+        Ok((
+            Some(ChildExecutionTask {
+                tree: self.tree.clone(),
+                parent: parent.clone(),
+                job: job.clone(),
+                proof,
+            }),
+            ChainEffects::default(),
+        ))
+    }
+    pub(crate) fn complete_connection(
+        &mut self,
+        done: ChildExecutionCompletion,
+        parent: &ChainTree,
+        now: i64,
+    ) -> Result<ChainEffects, StoreError> {
+        use lattice_block_tree::ChildConnectionExecution;
+        let cid = done.task.job.block_hash();
+        if self.tree.context() != done.task.tree.context()
+            || !self.tree.contains(cid)
+            || self.tree.is_executed(cid)
+            || self.tree.is_excluded_root(cid)
         {
+            return Ok(ChainEffects::default());
+        }
+        // Completion is private and minted only by an issued task. Rechecks in
+        // storage validate the securing proof and LIVE parent continuity.
+        match done.result {
             ChildConnectionExecution::Genesis(verified) => {
-                self.connected_genesis(parent, &verified, &proof, now)
+                let result = self.storage.import_child_genesis(
+                    &mut self.tree,
+                    parent,
+                    &verified,
+                    &done.task.proof,
+                    &self.journal_log_id,
+                );
+                self.execution_result(cid, result, now)
             }
             ChildConnectionExecution::Transition(verified) => {
-                self.connected_transition(parent, &verified, &proof, now)
+                let result = self.storage.import_child_transition(
+                    &mut self.tree,
+                    parent,
+                    &verified,
+                    &done.task.proof,
+                    &self.journal_log_id,
+                );
+                self.execution_result(cid, result, now)
             }
             ChildConnectionExecution::Unavailable => {
-                Ok(self.body_unavailable(job.block_hash(), now))
+                if self.bodies.connecting.as_deref() == Some(cid) {
+                    Ok(self.body_unavailable(cid, now))
+                } else {
+                    Ok(ChainEffects::default())
+                }
             }
             ChildConnectionExecution::AwaitingParent(link) => {
-                self.bodies.await_parent(
-                    job.block_hash().into(),
-                    CrossChainEvidenceRequirement::ParentStateContinuity(link),
-                );
+                if self.bodies.connecting.as_deref() == Some(cid) {
+                    self.bodies.await_parent(
+                        cid.into(),
+                        CrossChainEvidenceRequirement::ParentStateContinuity(link),
+                    );
+                }
                 Ok(self.finish(SyncTurn::default(), now))
             }
             ChildConnectionExecution::Rejected(rejection) => {
-                let cid = rejection.block_hash().to_owned();
+                let Some(rejection) = self.tree.refresh_child_rejection(rejection)? else {
+                    return Ok(ChainEffects::default());
+                };
                 let update = self.storage.import_child_rejection(
                     &mut self.tree,
                     rejection,
                     &self.journal_log_id,
                 )?;
-                self.bodies.completed(&cid);
+                self.bodies.completed(cid);
                 self.published(HeaderImport::Applied(update), now)
             }
         }
+    }
+    pub fn run_connection(
+        &mut self,
+        job: &lattice_block_tree::ConnectJob,
+        parent: &ChainTree,
+        now: i64,
+    ) -> Result<ChainEffects, StoreError> {
+        let (task, effects) = self.prepare_connection(job, parent, now)?;
+        let Some(task) = task else {
+            return Ok(effects);
+        };
+        let done = task.run(self.storage.as_ref(), now)?;
+        self.complete_connection(done, parent, now)
     }
 }

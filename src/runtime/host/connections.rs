@@ -8,6 +8,7 @@ use lattice_block_tree::{
 
 pub(super) struct ConnectionTask {
     task: RootConnectionTask,
+    session: acquire::Session,
     content: crate::storage::ConnectionContent,
 }
 pub(super) struct ConnectionCompletion {
@@ -16,11 +17,20 @@ pub(super) struct ConnectionCompletion {
 }
 impl ConnectionTask {
     pub(super) fn run(self) -> Result<ConnectionCompletion, crate::storage::StoreError> {
-        let verdict = self
-            .task
-            .run(&SnapshotSource(self.content.snapshot()), now())?;
+        let verdict = self.task.run(
+            &acquire::Source {
+                snapshot: self.content.snapshot(),
+                session: &self.session,
+            },
+            now(),
+        )?;
+        self.session.check()?;
         if let Some(header) = verdict.accepted_header() {
-            self.content.preserve(header)?;
+            self.content.preserve_acquired(
+                header,
+                &self.session.volumes(),
+                &self.session.entries(),
+            )?;
         }
         Ok(ConnectionCompletion {
             verdict,
@@ -37,7 +47,16 @@ impl Host {
         Ok(())
     }
     pub(super) fn release_unused_connection_pins(&mut self) -> anyhow::Result<()> {
-        let wanted = self.chain.wanted_root_bodies();
+        let mut wanted = self.chain.wanted_root_bodies();
+        for path in self.levels.ordered() {
+            if let Some(core) = self.levels.get(&path) {
+                wanted.extend(
+                    core.wanted_bodies()
+                        .into_iter()
+                        .map(|cid| format!("{}:{cid}", path.join("/"))),
+                );
+            }
+        }
         let stale: Vec<_> = self
             .connection_pins
             .keys()
@@ -87,7 +106,14 @@ impl Host {
                 .unwrap_or_default(),
         );
         self.active_connections.insert(task.block_hash().to_owned());
-        Ok(Some(ConnectionTask { task, content }))
+        Ok(Some(ConnectionTask {
+            task,
+            content,
+            session: acquire::Session::new(
+                self.acquisition_requests.clone(),
+                self.content_cache.clone(),
+            ),
+        }))
     }
     pub(super) fn complete_connection(
         &mut self,
@@ -147,7 +173,7 @@ impl Host {
 mod tests {
     use super::*;
     use tokio::time::{Duration, timeout};
-    async fn inspect<T: Send + 'static>(
+    pub(super) async fn inspect<T: Send + 'static>(
         handle: &HostHandle,
         inspect: impl FnOnce(&mut Host) -> T + Send + 'static,
     ) -> T {
@@ -163,7 +189,7 @@ mod tests {
             .unwrap();
         timeout(Duration::from_secs(5), rx).await.unwrap().unwrap()
     }
-    fn config(path: &std::path::Path) -> HostConfig {
+    pub(super) fn config(path: &std::path::Path) -> HostConfig {
         let rows: Value = serde_json::from_str(include_str!(
             "../../../../lattice-rs/crates/lattice-validation/tests/genesis-swift.json"
         ))
@@ -188,7 +214,7 @@ mod tests {
             seeds: vec![],
         }
     }
-    async fn block(handle: &HostHandle) -> (Value, Block) {
+    pub(super) async fn block(handle: &HostHandle) -> (Value, Block) {
         let (code, template) = handle
             .request("/mining/templates", json!({"recipients":[]}))
             .await
@@ -213,7 +239,7 @@ mod tests {
             .unwrap();
         (template, block)
     }
-    fn prepare(host: &mut Host, block: &Block) -> ConnectionTask {
+    pub(super) fn prepare(host: &mut Host, block: &Block) -> ConnectionTask {
         let cid = content_id(block).unwrap();
         let scope = format!("test-connect-{cid}");
         let volumes =
@@ -755,3 +781,7 @@ mod tests {
         running.task.await.unwrap().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "connections_acquisition_tests.rs"]
+mod acquisition_tests;

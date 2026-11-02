@@ -17,6 +17,7 @@ pub(crate) struct ConnectionContent {
 }
 struct Sources<'a> {
     snapshot: &'a DiskReadSnapshot,
+    volumes: &'a [SerializedVolume],
     entries: BTreeMap<&'a str, &'a [u8]>,
     failure: Mutex<Option<lattice_volume_broker::Error>>,
 }
@@ -61,17 +62,34 @@ impl ConnectionContent {
     pub(crate) fn snapshot(&self) -> &DiskReadSnapshot {
         &self.snapshot
     }
+    #[cfg(test)]
     pub(crate) fn preserve(&self, header: &BlockHeader) -> Result<(), StoreError> {
-        let mut owned = lattice_cashew::volume::serialize_recursive(header, &())?;
+        self.preserve_acquired(header, &[], &BTreeMap::new())
+    }
+    pub(crate) fn preserve_acquired(
+        &self,
+        header: &BlockHeader,
+        acquired: &[SerializedVolume],
+        reads: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), StoreError> {
+        let mut owned = acquired.to_vec();
+        owned.extend(lattice_cashew::volume::serialize_recursive(header, &())?);
         owned.sort_by(|a, b| a.root.cmp(&b.root));
         let source = Sources {
             snapshot: &self.snapshot,
+            volumes: &owned,
             failure: Mutex::new(None),
-            entries: owned
+            entries: reads
                 .iter()
-                .flat_map(|v| v.entries.iter().map(|(c, b)| (c.as_str(), b.as_slice())))
+                .map(|(c, b)| (c.as_str(), b.as_slice()))
+                .chain(
+                    owned
+                        .iter()
+                        .flat_map(|v| v.entries.iter().map(|(c, b)| (c.as_str(), b.as_slice()))),
+                )
                 .collect(),
         };
+        self.storage.record_serving_bundle(&header.raw_cid, &source);
         let db = Connection::open("")?;
         db.execute_batch("PRAGMA temp_store=FILE; PRAGMA cache_size=-1024; PRAGMA journal_mode=OFF; CREATE TABLE frontier(root TEXT PRIMARY KEY,done INTEGER NOT NULL DEFAULT 0); CREATE INDEX ready ON frontier(done,root); CREATE TABLE states(state TEXT,root TEXT,header BLOB,done INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(state,root)); CREATE INDEX state_ready ON states(state,done,root);")?;
         if let Some(block) = header.node.as_deref() {
@@ -94,7 +112,14 @@ impl ConnectionContent {
                 Some(volume) => Some(volume),
                 None => match owned.binary_search_by(|v| v.root.cmp(&root)) {
                     Ok(index) => Some(owned[index].clone()),
-                    Err(_) => self.snapshot.fetch_covering_volume(&root)?,
+                    Err(_) => match self.snapshot.fetch_covering_volume(&root)? {
+                        Some(volume) => Some(volume),
+                        None => owned
+                            .iter()
+                            .find(|v| v.entries.contains_key(&root))
+                            .cloned()
+                            .or_else(|| leaf_read_volume(&root, reads)),
+                    },
                 },
             };
             let Some(volume) = volume else {
@@ -103,8 +128,9 @@ impl ConnectionContent {
             volume.validate()?;
             // Child bodies are anticipatory dependencies. Malformed/unavailable
             // child data cannot change the already-authenticated root verdict.
-            for bytes in volume.entries.values() {
+            for (cid, bytes) in &volume.entries {
                 if let Ok(block) = cbor::decode::<Block>(bytes) {
+                    self.storage.record_serving_bundle(cid, &source);
                     self.preserve_state(&db, &source, &block.post_state)?;
                 }
             }
@@ -153,6 +179,9 @@ impl ConnectionContent {
             for volume in &mut volumes {
                 if let Some(existing) = self.snapshot.fetch_volume(&volume.root)? {
                     *volume = existing;
+                } else if let Some(existing) = source.volumes.iter().find(|v| v.root == volume.root)
+                {
+                    *volume = existing.clone();
                 }
             }
             let children = node.children(source);
@@ -327,6 +356,22 @@ fn references(volume: &SerializedVolume) -> Result<BTreeSet<String>, StoreError>
     Ok(refs)
 }
 
+// Cache entries have no completeness manifest. Only known leaf DAG types may
+// be rebuilt as exact boundaries; never promote an arbitrary singleton entry.
+fn leaf_read_volume(root: &str, reads: &BTreeMap<String, Vec<u8>>) -> Option<SerializedVolume> {
+    let bytes = reads.get(root)?;
+    let volume = if let Ok(node) = cbor::decode::<lattice_primitives::ChainSpec>(bytes) {
+        lattice_cashew::volume::serialize_boundary(&lattice_cashew::Volume::new(node).ok()?, &())
+            .ok()?
+    } else if let Ok(node) = cbor::decode::<lattice_primitives::WasmPolicyModule>(bytes) {
+        lattice_cashew::volume::serialize_boundary(&lattice_cashew::Volume::new(node).ok()?, &())
+            .ok()?
+    } else {
+        return None;
+    };
+    (volume.root == root).then_some(volume)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +485,7 @@ mod tests {
             db.execute_batch("CREATE TABLE states(state TEXT,root TEXT,header BLOB,done INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(state,root));").unwrap();
             let source = Sources {
                 snapshot: content.snapshot(),
+                volumes: &[],
                 failure: Mutex::new(None),
                 entries: BTreeMap::new(),
             };

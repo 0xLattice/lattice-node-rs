@@ -7,8 +7,9 @@ impl Host {
             .fetches
             .iter()
             .filter_map(|(id, fetch)| {
-                (matches!(fetch, Fetch::Operator(_))
+                ((matches!(fetch, Fetch::Operator(_))
                     && self.replies.get(id).is_none_or(|reply| reply.is_closed()))
+                    || matches!(fetch, Fetch::Worker(reply,cancel) if reply.is_closed() || cancel.load(std::sync::atomic::Ordering::Acquire)))
                 .then_some(*id)
             })
             .collect();

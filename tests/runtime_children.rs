@@ -174,7 +174,14 @@ async fn hosted_actor_syncs_proof_bound_child_and_recovers() {
     }
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            if b.handle.volume(&child_cid).await.unwrap().is_some() {
+            if b.handle.volume(&child_cid).await.unwrap().is_some()
+                && b.handle
+                    .request("/api/chain/info?chainPath=Nexus%2FAlpha", json!({}))
+                    .await
+                    .unwrap()
+                    .1["acceptsSubmit"]
+                    == true
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

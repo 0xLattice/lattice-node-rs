@@ -20,6 +20,7 @@ struct Fence {
     children: BTreeMap<Vec<String>, LevelFence>,
 }
 pub(super) struct TemplateTask {
+    session: acquire::Session,
     job: TemplateJob,
     fence: Fence,
     anchor: Option<lattice_validation::DifficultyAnchor>,
@@ -37,17 +38,26 @@ impl TemplateTask {
     pub(super) fn run(self) -> TemplateCompletion {
         let output = super::super::merged_template::build_merged_template(
             &self.job,
-            &SnapshotSource(self.content.snapshot()),
+            &acquire::Source {
+                snapshot: self.content.snapshot(),
+                session: &self.session,
+            },
             now(),
             self.anchor,
             &self.contexts,
         );
-        let preserved = match &output {
+        let preserved = self.session.check().and_then(|()| match &output {
             Ok(output) => Volume::new(output.build.block.clone())
                 .map_err(crate::storage::StoreError::from)
-                .and_then(|header| self.content.preserve(&header)),
+                .and_then(|header| {
+                    self.content.preserve_acquired(
+                        &header,
+                        &self.session.volumes(),
+                        &self.session.entries(),
+                    )
+                }),
             Err(_) => Ok(()),
-        };
+        });
         TemplateCompletion {
             content: Arc::new(self.content),
             preserved,
@@ -121,7 +131,14 @@ impl Host {
             &format!("template-{}", job.id),
             vec![],
         );
+        let session = acquire::Session::new(
+            self.acquisition_requests.clone(),
+            self.content_cache.clone(),
+        );
+        self.template_acquisitions
+            .insert(job.id, (job.clone(), Arc::downgrade(&session.cancelled)));
         Ok(Some(TemplateTask {
+            session,
             content,
             job,
             fence,
@@ -168,6 +185,16 @@ impl Host {
             .filter_map(|(id, reply)| reply.is_closed().then_some(*id))
             .collect();
         self.mining.cancel_template_requests(&closed);
+        self.template_acquisitions.retain(|_, (job, cancel)| {
+            let Some(cancel) = cancel.upgrade() else {
+                return false;
+            };
+            if !self.mining.state().template_job_pending(job) {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+                return false;
+            }
+            true
+        });
         let time = now();
         self.template_content.retain(|id, _| {
             self.mining
@@ -232,16 +259,37 @@ mod tests {
             i64::MAX,
         )
         .unwrap();
+        let mut bootstrap =
+            lattice_cashew::volume::serialize_recursive(verified.header(), &()).unwrap();
+        for policy in &verified.spec().0.node.as_deref().unwrap().wasm_policies {
+            if let Some(bytes) = entries.get(&policy.module_cid) {
+                bootstrap.push(SerializedVolume::new(
+                    policy.module_cid.clone(),
+                    BTreeMap::from([(policy.module_cid.clone(), bytes.clone())]),
+                ));
+            }
+        }
+        let policy_volumes: Vec<_> = bootstrap
+            .iter()
+            .filter(|v| {
+                verified
+                    .spec()
+                    .0
+                    .node
+                    .as_deref()
+                    .unwrap()
+                    .wasm_policies
+                    .iter()
+                    .any(|p| p.module_cid == v.root)
+            })
+            .cloned()
+            .collect();
         let dir = tempfile::tempdir().unwrap();
         let host = start_with_retention(
             HostConfig {
                 directory: dir.path().into(),
                 genesis_cid: cid,
-                bootstrap_volumes: lattice_cashew::volume::serialize_recursive(
-                    verified.header(),
-                    &(),
-                )
-                .unwrap(),
+                bootstrap_volumes: bootstrap,
                 signing_key: ed25519_dalek::SigningKey::from_bytes(&[73; 32]),
                 listen: "127.0.0.1:0".parse().unwrap(),
                 min_relay_fee: 1,
@@ -251,6 +299,14 @@ mod tests {
         )
         .await
         .unwrap();
+        if !policy_volumes.is_empty() {
+            inspect(&host.handle, move |h| {
+                h.storage
+                    .cache_volumes("fixture-policy", &policy_volumes)
+                    .unwrap()
+            })
+            .await;
+        }
         (dir, host)
     }
     #[tokio::test(flavor = "current_thread")]
@@ -591,3 +647,7 @@ mod tests {
 #[cfg(test)]
 #[path = "templates/lifetime_tests.rs"]
 mod lifetime_tests;
+
+#[cfg(test)]
+#[path = "templates/acquisition_tests.rs"]
+mod acquisition_tests;

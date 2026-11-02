@@ -1,0 +1,14 @@
+{
+  "latticeRevision": "dda2d852429a27be6043599b63bde81530cd9514",
+  "cases": 16,
+  "scope": "Original full pinned BlockHeader.storeBlock selected root sets; local source only, scheduling and cache excluded",
+  "sourceSha256": {
+    "Sources/LatticePrimitives/Block/Block+Content.swift": "fc70a5a67af5ee323a2de11c023169285064d3480560c3c3bfdeb31f99448157"
+  },
+  "harnessSha256": {
+    "examples/serving-bundle-samples.rs": "ac28d4990251488afdcbf776a10dde8c5d3e7ba2c545ac2387afcdaad434fb83",
+    "tests/serving-bundle-swift-oracle.swift": "d22d692ff7305f0104deba2467af19cb054d45ce1c93f2a66eecad2672c58a9a",
+    "tools/serving-bundle-swift-check.py": "57221df33e1198e753c01f8b0bfd28ba791a976ade511d1072dc5355440daba3"
+  },
+  "corpusSha256": "572f1fd377bb6190f4374e7bbe8dc90876250df695435ac3a9809a9bdf008b67"
+}

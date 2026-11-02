@@ -1,4 +1,5 @@
 //! Root platform host: bounded command ingress, durable core execution and Ivy I/O.
+mod acquire;
 mod discovery;
 mod fetches;
 mod operator;
@@ -6,6 +7,7 @@ pub use discovery::DiscoveryConfig;
 mod child_author;
 mod read_endpoints;
 pub use read_endpoints::ReadEndpointConfig;
+mod child_connections;
 mod child_mining;
 mod children;
 mod configuration;
@@ -102,6 +104,10 @@ fn error(message: impl ToString) -> (u16, Value) {
     (400, json!({"error":{"message":message.to_string()}}))
 }
 enum Fetch {
+    Worker(
+        oneshot::Sender<acquire::Answer>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ),
     Body(String),
     Index(PeerId, String),
     Transaction(PeerId, String),
@@ -113,6 +119,7 @@ enum Work {
     ReadEndpoints(u64, Vec<String>),
     Chain(ChainEffects),
     RootConnect(lattice_block_tree::ConnectJob),
+    ChildConnect(Vec<String>, lattice_block_tree::ConnectJob),
     Child(Vec<String>, ChainEffects),
     ChildMining(Vec<String>, Box<MiningEffect>),
     HostLevels(u64, configuration::HostedConfiguration),
@@ -125,6 +132,12 @@ struct MinedReply {
     children: Vec<(String, String)>,
 }
 struct Host {
+    acquisitions: mpsc::Receiver<acquire::Request>,
+    content_cache: Arc<std::sync::Mutex<super::content_cache::ContentCache>>,
+    acquisition_requests: mpsc::Sender<acquire::Request>,
+    template_acquisitions:
+        BTreeMap<u64, (TemplateJob, std::sync::Weak<std::sync::atomic::AtomicBool>)>,
+    active_child_connections: BTreeSet<(Vec<String>, String)>,
     preflights: preflight::Preflights,
     health: health::PublishedHealth,
     read_endpoint_config: ReadEndpointConfig,
@@ -302,6 +315,9 @@ async fn start_inner(
     let (mining, restored) =
         DurableMiningCore::restore(state, storage.clone(), &["Nexus".into()], now())?;
     let ledger = super::serving::ServingLedger::open(&config.directory)?;
+    let content_cache = Arc::new(std::sync::Mutex::new(
+        super::content_cache::ContentCache::new(overlay.resources.max_acquisition_bytes / 4),
+    ));
     let mut network = Network::bind_with_overlay(
         config.listen,
         config.signing_key,
@@ -345,7 +361,13 @@ async fn start_inner(
     let public_key = network.public_key.clone();
     let (commands, input) = mpsc::channel(128);
     let health = health::PublishedHealth::default();
+    let (acquisition_requests, acquisitions) = mpsc::channel(16);
     let mut host = Host {
+        acquisition_requests,
+        acquisitions,
+        content_cache,
+        active_child_connections: BTreeSet::new(),
+        template_acquisitions: BTreeMap::new(),
         preflights: preflight::Preflights::default(),
         health: health.clone(),
         read_endpoint_config,
@@ -515,14 +537,28 @@ impl Host {
                 next.extend(self.levels.get(&path).unwrap().acquisition_frontier());
             }
             self.network.prioritize_acquisitions(next);
+            let mut distances = self.chain.body_distances();
+            for path in self.levels.ordered() {
+                if let Some(core) = self.levels.get(&path) {
+                    for (cid, distance) in core.body_distances() {
+                        distances
+                            .entry(cid)
+                            .and_modify(|d| *d = (*d).min(distance))
+                            .or_insert(distance);
+                    }
+                }
+            }
+            self.content_cache.lock().unwrap().order(distances);
             self.publish_health();
             self.maintain_retention();
             self.maintain_discovery().await?;
             tokio::select! {
+             Some(request)=self.acquisitions.recv()=>self.acquire_dependency(request).await?,
              completion=self.preflights.next(), if self.preflights.active()=>{
                 match completion? {
                     preflight::Completion::Template(done)=>self.complete_template(*done)?,
                     preflight::Completion::Connection(done)=>self.complete_connection(done)?,
+                    preflight::Completion::ChildConnection(done)=>self.complete_child_connection(*done)?,
                     preflight::Completion::Root(done)=>{
                         let effects=self.mining.complete_root_preflight(done,now())?;
                         self.enqueue(effects);
@@ -645,6 +681,13 @@ impl Host {
             }
             NetworkEvent::Fetched(id, volumes, _reservation) => {
                 if let Some(fetch) = self.fetches.remove(&id) {
+                    if let Fetch::Worker(reply, _) = fetch {
+                        let _ = reply.send(acquire::Answer {
+                            volumes: volumes.unwrap_or_default(),
+                            reservation: _reservation,
+                        });
+                        return Ok(());
+                    }
                     if let Fetch::Operator(root) = fetch {
                         use base64::Engine;
                         let volume = volumes.and_then(|vs| vs.into_iter().find(|v| v.root == root));
@@ -660,6 +703,12 @@ impl Host {
                     }
 
                     if let Some(volumes) = &volumes {
+                        if let Fetch::Body(cid) | Fetch::ChildBody(_, cid) = &fetch {
+                            self.content_cache
+                                .lock()
+                                .unwrap()
+                                .body(cid.clone(), volumes);
+                        }
                         let scope = format!("network-{id}");
                         self.storage.cache_volumes(&scope, volumes)?;
                         if let Fetch::Body(cid) = &fetch {
@@ -667,12 +716,17 @@ impl Host {
                                 .entry(cid.clone())
                                 .or_default()
                                 .push(scope);
+                        } else if let Fetch::ChildBody(path, cid) = &fetch {
+                            self.connection_pins
+                                .entry(format!("{}:{cid}", path.join("/")))
+                                .or_default()
+                                .push(scope);
                         } else {
                             self.transient.push(scope);
                         }
                     }
                     match fetch {
-                        Fetch::Operator(_) => unreachable!(),
+                        Fetch::Operator(_) | Fetch::Worker(..) => unreachable!(),
                         Fetch::ChildBody(path, cid) => {
                             if let Some(core) = self.levels.get_mut(&path) {
                                 let effects = if volumes.is_some() {
@@ -746,7 +800,10 @@ impl Host {
         let mut deferred_connections = VecDeque::new();
         while let Some(work) = self.queue.pop_front() {
             match work {
-                Work::RootConnect(job) => deferred_connections.push_back(job),
+                Work::RootConnect(job) => deferred_connections.push_back(Work::RootConnect(job)),
+                Work::ChildConnect(path, job) => {
+                    deferred_connections.push_back(Work::ChildConnect(path, job))
+                }
                 Work::ReadEndpoints(id, path) => {
                     self.network.lookup_read_endpoints(id, path).await?
                 }
@@ -878,7 +935,7 @@ impl Host {
                                 self.needs_fetch.remove(&cid);
                             }
                             BodyEffect::Connect(job) => {
-                                deferred_connections.push_back(job);
+                                deferred_connections.push_back(Work::RootConnect(job));
                             }
                         }
                     }
@@ -1045,12 +1102,21 @@ impl Host {
             let Some(job) = deferred_connections.pop_front() else {
                 break;
             };
-            if let Some(task) = self.prepare_connection(job)? {
-                self.preflights.start_connection(task);
+            match job {
+                Work::RootConnect(job) => {
+                    if let Some(task) = self.prepare_connection(job)? {
+                        self.preflights.start_connection(task);
+                    }
+                }
+                Work::ChildConnect(path, job) => {
+                    if let Some(task) = self.prepare_child_connection(path, job)? {
+                        self.preflights.start_child_connection(task);
+                    }
+                }
+                _ => unreachable!(),
             }
         }
-        self.queue
-            .extend(deferred_connections.into_iter().map(Work::RootConnect));
+        self.queue.extend(deferred_connections);
         while !self.preflights.full() {
             let Some(work) = deferred_preflights.pop_front() else {
                 break;

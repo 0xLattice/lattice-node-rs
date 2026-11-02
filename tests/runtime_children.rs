@@ -144,6 +144,13 @@ async fn hosted_actor_syncs_proof_bound_child_and_recovers() {
         seeds,
     };
     let a = start(config(tmp.path().into(), 81, vec![])).await.unwrap();
+    let initial = a.handle.health("/health");
+    assert_eq!(initial.0, 200);
+    assert_eq!(initial.1["tipCID"], hash);
+    assert_eq!(initial.1["height"], "0");
+    assert!(initial.1.get("revision").is_none());
+    assert!(initial.1.get("templateDigest").is_none());
+    assert_eq!(a.handle.health("/health?chainPath=Nexus/Alpha").0, 404);
     let b = start(config(
         other.path().into(),
         82,
@@ -233,6 +240,11 @@ async fn hosted_actor_syncs_proof_bound_child_and_recovers() {
         .unwrap();
     assert_eq!(status, 200);
     assert_eq!(waiting["phase"], "awaitingGenesis");
+    let health = b.handle.health("/health?chainPath=Nexus/Beta");
+    assert_eq!(health.0, 200);
+    assert_eq!(health.1["phase"], "awaitingGenesis");
+    assert!(health.1.get("tipCID").is_none());
+    assert_eq!(b.handle.health("/health?chainPath=Nexus//Beta").0, 404);
     assert!(waiting.get("tipCID").is_none());
     assert_eq!(
         b.handle
@@ -277,9 +289,15 @@ async fn hosted_actor_syncs_proof_bound_child_and_recovers() {
             .is_empty()
     );
     drop(reopened);
-    let restored = start(config(other.path().into(), 82, vec![]))
-        .await
-        .unwrap();
+    let restored = lattice_node::runtime::host::start_with_hosted_configuration(
+        config(other.path().into(), 82, vec![]), Default::default(), Default::default(), Default::default(),
+        json!({"hostChain":["Nexus/Alpha"]}),
+    ).await.unwrap();
+    let health = restored.handle.health("/health?chainPath=Nexus/Alpha");
+    assert_eq!(health.0, 200);
+    assert_eq!(health.1["tipCID"], child_cid);
+    assert_eq!(health.1["height"], "0");
+    assert_eq!(restored.handle.health("/health?chainPath=Nexus/Beta").0, 404);
     assert_eq!(
         restored
             .handle

@@ -58,6 +58,22 @@ def main():
             balances=accounts();assert balances[owner]['balance']==str(2*1048576-3) and balances[owner]['nonce']=='1',balances
             assert balances[shared.GENESIS]['balance']=='3',balances
             report['balances']=balances
+            def health_check():
+                values=[]
+                for listener in ['rpc','publicRead']:
+                    base='http://'+node.ready[listener]
+                    with urllib.request.urlopen(base+'/health',timeout=5) as response:
+                        value=json.load(response)
+                        assert response.headers['cache-control']=='public, max-age=3'
+                    assert value['tipCID']==cid and value['height']=='2' and value['bestHeaderHeight']=='2',value
+                    assert 'templateDigest' not in value and 'revision' not in value,value
+                    with urllib.request.urlopen(urllib.request.Request(base+'/health',method='HEAD'),timeout=5) as response:
+                        assert response.status==200 and response.read()==b''
+                    values.append(value)
+                assert values[0]==values[1],values
+                return values[0]
+            report['health']=health_check()
+
             immutable='public, max-age=31536000, immutable'
             changing='public, max-age=3'
             report['cache_headers']={}
@@ -69,6 +85,25 @@ def main():
                 code,value=request(node,route,body);assert code==404,(route,code,value)
             node.stop();node.config['publicSubmit']=False;node.start();assert accounts()==balances
             report['restart_balances']=accounts()
+            report['restart_health']=health_check()
+            assert node.rpc('/hosted-chains',{'hostChain':['Nexus/Beta']})[0]==200
+            for listener in ['rpc','publicRead']:
+                base='http://'+node.ready[listener]
+                with urllib.request.urlopen(base+'/health?chainPath=Nexus/Beta',timeout=5) as response:
+                    value=json.load(response)
+                    assert value['phase']=='awaitingGenesis' and 'tipCID' not in value and 'height' not in value,value
+                for path in ['Nexus//Beta','Nexus/Beta/','Nexus/Unknown']:
+                    try:
+                        urllib.request.urlopen(base+'/health?chainPath='+path,timeout=5)
+                        raise AssertionError('invalid scope was served')
+                    except urllib.error.HTTPError as error: assert error.code==404
+            assert node.rpc('/hosted-chains',{'hostChain':[]})[0]==200
+            for listener in ['rpc','publicRead']:
+                try:
+                    urllib.request.urlopen('http://'+node.ready[listener]+'/health?chainPath=Nexus/Beta',timeout=5)
+                    raise AssertionError('unhosted scope was served')
+                except urllib.error.HTTPError as error: assert error.code==404
+            report['health_scopes']=True
             code,info=request(node,'/api/chain/info',cache=changing)
             assert code==200 and info['acceptsSubmit'] is False,(code,info)
             code,value=request(node,'/transactions',transaction);assert code==404,(code,value)

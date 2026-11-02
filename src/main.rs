@@ -161,6 +161,10 @@ fn identity(path: &Path) -> anyhow::Result<SigningKey> {
 }
 struct Backend(HostHandle);
 impl RpcBackend for Backend {
+    fn health(&self, route: String) -> RpcFuture {
+        let value = self.0.health(&route);
+        Box::pin(async move { Ok(value) })
+    }
     fn remote_volume(&self, cid: String) -> lattice_node::runtime::api::VolumeFuture {
         let handle = self.0.clone();
         Box::pin(async move {

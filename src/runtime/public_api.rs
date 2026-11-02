@@ -165,8 +165,8 @@ async fn dispatch(
             public_volume(&state, cid, request.uri().query()).await
         } else if path == "/health" {
             let is_head = request.method() == Method::HEAD;
-            // Cache only the root snapshot, as in Swift. A scoped health read
-            // goes through the same bounded backend request path as status.
+            // Cache only the root snapshot. Both scoped and root health read
+            // published state independently of the runtime command queue.
             let query = request.uri().query();
             let root = query.is_none_or(|q| {
                 form_urlencoded::parse(q.as_bytes())
@@ -177,8 +177,7 @@ async fn dispatch(
             let mut response = if root {
                 health(&state, route).await
             } else {
-                *request.uri_mut() = route.parse().unwrap();
-                api::serve(&state.backend, &state.slots, request).await
+                api::health_response(&state.backend, route).await
             };
             if is_head {
                 *response.body_mut() = Body::empty();
@@ -238,7 +237,7 @@ async fn health(state: &PublicState, route: String) -> Response {
         tokio::spawn(async move {
             let result = match tokio::time::timeout(
                 Duration::from_secs(30),
-                backend.request(route, serde_json::json!({})),
+                backend.health(route),
             )
             .await
             {
@@ -366,6 +365,7 @@ mod tests {
         gate: Arc<Semaphore>,
     }
     impl RpcBackend for Gated {
+    fn health(&self, route: String) -> api::RpcFuture { self.request(route, serde_json::json!({})) }
         fn request(&self, _: String, _: Value) -> api::RpcFuture {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let gate = self.gate.clone();

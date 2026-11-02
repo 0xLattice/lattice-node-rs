@@ -114,3 +114,13 @@ seeds wakes maintenance and respects its peer threshold instead of unconditional
 dialling the new list. The four-host child test exercises all three ancestry books,
 seed-update suppression, remembered peers before seeds across restart, fallback
 after remembered peers stop, and isolated restart.
+
+`tools/child-peer-memory-swift.py` builds the pinned, unchanged full Swift runtime
+and runs four loopback nodes with STUN, health probes and public seeds disabled.
+It checks child-only memory enablement, three ancestry books on disk, conditional
+seed updates, remembered-peer reconnection, fallback and isolated memory policy.
+The report records whether a newly configured seed was also contacted on restart:
+Swift can contact it before the reconnected peers' hosted capabilities arrive.
+The Rust test's exact seed-suppression assertion describes its controlled fixture;
+it is not a claim that every Swift restart suppresses every seed dial. Reports
+and compiler/run logs stay under ignored `target/child-peer-memory-swift`.

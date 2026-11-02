@@ -13,6 +13,7 @@ mod proofs;
 mod reads;
 mod retention;
 mod validation;
+mod health;
 use super::network::{Network, NetworkEvent};
 use crate::{
     core::{
@@ -47,6 +48,7 @@ pub struct HostConfig {
 }
 #[derive(Clone)]
 pub struct HostHandle {
+    health: health::PublishedHealth,
     commands: mpsc::Sender<Command>,
 }
 pub struct RunningHost {
@@ -61,6 +63,9 @@ enum Command {
     Shutdown,
 }
 impl HostHandle {
+    pub fn health(&self, route: &str) -> (u16, Value) {
+        self.health.read(route)
+    }
     pub async fn request(&self, route: &str, body: Value) -> anyhow::Result<(u16, Value)> {
         let (tx, rx) = oneshot::channel();
         self.commands
@@ -110,6 +115,7 @@ struct MinedReply {
     children: Vec<(String, String)>,
 }
 struct Host {
+    health: health::PublishedHealth,
     read_endpoint_config: ReadEndpointConfig,
     chain: RootChainCore,
     levels: crate::core::levels::HostedLevels,
@@ -272,7 +278,9 @@ async fn start_inner(
     let overlay_addr = network.address;
     let public_key = network.public_key.clone();
     let (commands, input) = mpsc::channel(128);
+    let health = health::PublishedHealth::default();
     let mut host = Host {
+        health: health.clone(),
         read_endpoint_config,
         chain,
         levels: Default::default(),
@@ -305,9 +313,10 @@ async fn start_inner(
         host.network.stop().await;
         return Err(error);
     }
+    host.publish_health();
     let task = tokio::spawn(host.run(input));
     Ok(RunningHost {
-        handle: HostHandle { commands },
+        handle: HostHandle { commands, health },
         overlay_addr,
         public_key,
         task,
@@ -417,6 +426,7 @@ impl Host {
         loop {
             self.cancel_abandoned_fetches().await?;
             self.drain().await?;
+            self.publish_health();
             self.maintain_retention();
             self.maintain_discovery().await?;
             tokio::select! {

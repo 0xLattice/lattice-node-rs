@@ -11,6 +11,7 @@ use std::sync::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct Backend(AtomicUsize);
 impl RpcBackend for Backend {
+    fn health(&self, route: String) -> RpcFuture { self.request(route, serde_json::json!({})) }
     fn request(&self, route: String, _body: Value) -> RpcFuture {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
@@ -313,6 +314,7 @@ async fn volumes_validate_canonical_cid_and_scope_before_content_and_disabled_is
 
 struct CacheReads;
 impl RpcBackend for CacheReads {
+    fn health(&self, route: String) -> RpcFuture { self.request(route, serde_json::json!({})) }
     fn request(&self, route: String, _: Value) -> RpcFuture {
         Box::pin(async move {
             if route.contains("missing") {
@@ -414,5 +416,55 @@ async fn cache_headers_follow_content_identity_and_submit_capability_follows_lis
         }
         server.abort();
         let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn both_health_listeners_bypass_actor_and_ordinary_rpc_capacity() {
+    struct Published;
+    impl RpcBackend for Published {
+        fn request(&self, _: String, _: Value) -> RpcFuture {
+            panic!("health must never enter the actor backend")
+        }
+        fn health(&self, route: String) -> RpcFuture {
+            Box::pin(async move {
+                if route.contains("chainPath=Nexus/Alpha") {
+                    Ok((200,json!({"phase":"awaitingGenesis","chainPath":["Nexus","Alpha"],"mempoolCount":0,"mempoolBytes":0})))
+                } else if route.contains("chainPath=") {
+                    Ok((404,json!({"error":"not found"})))
+                } else {
+                    Ok((200,json!({"phase":"active","chainPath":["Nexus"],"tipCID":"published-tip","height":"9","bestHeaderHeight":"10","mempoolCount":2,"mempoolBytes":30})))
+                }
+            })
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let backend: Arc<dyn RpcBackend> = Arc::new(Published);
+    let cookie = Arc::new(lattice_node::runtime::api::Cookie::create(
+        &directory.path().join("cookie"), Default::default(),
+    ).unwrap());
+    for app in [
+        lattice_node::runtime::api::router(backend.clone(),cookie),
+        public_api::router(backend.clone(),RateLimits::default()).unwrap(),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener,app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap()
+        });
+        for (method,path,code) in [
+            ("GET","/health",200), ("HEAD","/health",200),
+            ("GET","/health?chainPath=Nexus/Alpha",200),
+            ("GET","/health?chainPath=Nexus//Alpha",404),
+        ] {
+            let response = call(address,&request(method,path,"","")).await;
+            assert!(response.starts_with(&format!("HTTP/1.1 {code}")),"{response}");
+            if code == 200 {
+                assert!(response.contains("cache-control: public, max-age=3"));
+            }
+            if method == "HEAD" { assert!(response.ends_with("\r\n\r\n")); }
+            if method == "GET" && path == "/health" { assert!(response.contains("published-tip")); }
+        }
+        task.abort();
     }
 }

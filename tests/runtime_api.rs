@@ -10,6 +10,7 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct Backend(AtomicUsize);
 impl RpcBackend for Backend {
+    fn health(&self, route: String) -> RpcFuture { Box::pin(async move { Ok((200, json!({"route":route}))) }) }
     fn request(&self, route: String, body: Value) -> RpcFuture {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move { Ok((200, json!({"route":route,"received":body}))) })

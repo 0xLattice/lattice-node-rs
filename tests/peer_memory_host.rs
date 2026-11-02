@@ -324,3 +324,99 @@ async fn child_only_seeds_enable_all_initial_books_and_remembered_peers_precede_
     stop(node).await;
     stop(unused).await;
 }
+
+#[tokio::test]
+async fn explicit_peer_is_kept_after_initial_refusal_and_restart_without_author_restart() {
+    use serde_json::json;
+    let (cid, volumes) = fixture();
+    let parent_dir = tempfile::tempdir().unwrap();
+    let author_dir = tempfile::tempdir().unwrap();
+    let lease = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = lease.local_addr().unwrap();
+    let parent_key = ed25519_dalek::SigningKey::from_bytes(&[141; 32]);
+    let parent_peer = ivy_core::PeerEndpoint {
+        public_key: hex::encode(parent_key.verifying_key().to_bytes()),
+        host: "127.0.0.1".into(),
+        port: address.port(),
+    };
+    let parent_config = |bootstrap| HostConfig {
+        directory: parent_dir.path().into(),
+        genesis_cid: cid.clone(),
+        bootstrap_volumes: if bootstrap { volumes.clone() } else { vec![] },
+        signing_key: parent_key.clone(),
+        listen: address,
+        min_relay_fee: 1,
+        seeds: vec![],
+    };
+    drop(lease);
+    // Default 600-second discovery cadence and no named seed layer. The parent
+    // is initially absent: only configured Ivy topology can retry this dial.
+    let author = start(HostConfig {
+        directory: author_dir.path().into(),
+        genesis_cid: cid.clone(),
+        bootstrap_volumes: volumes.clone(),
+        signing_key: ed25519_dalek::SigningKey::from_bytes(&[142; 32]),
+        listen: "127.0.0.1:0".parse().unwrap(),
+        min_relay_fee: 1,
+        seeds: vec![parent_peer.clone()],
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(peers(&author).await.is_empty());
+    let parent = start(parent_config(true)).await.unwrap();
+    wait_peers(&author, &BTreeSet::from([parent_peer.public_key.clone()])).await;
+    async fn mine(parent: &RunningHost) -> String {
+        let (code, template) = parent
+            .handle
+            .request("/mining/templates", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(code, 200, "{template}");
+        let mut block: lattice_primitives::Block =
+            serde_json::from_value(template["block"].clone()).unwrap();
+        let nonce = (0..100_000)
+            .find(|nonce| {
+                block.nonce = *nonce;
+                block.has_valid_pow()
+            })
+            .unwrap();
+        let (code, result) = parent
+            .handle
+            .request(
+                "/mining/work",
+                json!({"workID":template["workID"],"nonce":nonce}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(code, 200, "{result}");
+        assert_eq!(result["accepted"], true, "{result}");
+        result["tipCID"].as_str().unwrap().into()
+    }
+    async fn synced(author: &RunningHost, tip: &str) {
+        timeout(Duration::from_secs(15), async {
+            loop {
+                let (code, status) = author.handle.request("/status", Value::Null).await.unwrap();
+                assert_eq!(code, 200);
+                if status["tipCID"] == tip {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    synced(&author, &mine(&parent).await).await;
+    stop(parent).await;
+    wait_peers(&author, &BTreeSet::new()).await;
+    // Reuse the parent's identity, durable journal and address. Mine while the
+    // author remains alive; the new authenticated session must resume sync.
+    let parent = start(parent_config(false)).await.unwrap();
+    let tip = mine(&parent).await;
+    synced(&author, &tip).await;
+    let (_, status) = author.handle.request("/status", Value::Null).await.unwrap();
+    assert_eq!(status["height"], "2");
+    stop(author).await;
+    stop(parent).await;
+}

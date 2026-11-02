@@ -238,12 +238,13 @@ async fn start_inner(
     let (mining, restored) =
         DurableMiningCore::restore(state, storage.clone(), &["Nexus".into()], now())?;
     let ledger = super::serving::ServingLedger::open(&config.directory)?;
-    let mut network = Network::bind_with_tally(
+    let mut network = Network::bind_with_configured_peers(
         config.listen,
         config.signing_key,
         config.genesis_cid.clone(),
         storage.clone(),
         ledger.tally(),
+        config.seeds.clone(),
     )
     .await?;
     network.configure_read_endpoints(
@@ -271,9 +272,6 @@ async fn start_inner(
         &initial_paths,
         child_seeds,
     );
-    for seed in config.seeds {
-        network.connect(seed).await?;
-    }
     let executed_children = storage
         .journal()
         .executed_child_directories(&["Nexus".into()])?;

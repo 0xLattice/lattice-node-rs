@@ -134,6 +134,18 @@ impl Network {
         storage: Arc<NodeStorage>,
         tally: lattice_tally::Tally,
     ) -> anyhow::Result<Self> {
+        Self::bind_with_configured_peers(address, key, genesis, storage, tally, vec![]).await
+    }
+    /// Explicit operator peers belong to Ivy's kept topology, including initial
+    /// dial failure and transport-loss backoff. Conditional discovery seeds do not.
+    pub async fn bind_with_configured_peers(
+        address: SocketAddr,
+        key: ed25519_dalek::SigningKey,
+        genesis: String,
+        storage: Arc<NodeStorage>,
+        tally: lattice_tally::Tally,
+        bootstrap_peers: Vec<PeerEndpoint>,
+    ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
         let mut config = Config::new(key);
@@ -147,16 +159,19 @@ impl Network {
                     port: address.port(),
                 });
         }
+        let settings = CoreSettings {
+            listen_port: Some(address.port()),
+            bootstrap_peers,
+            ..CoreSettings::default()
+        };
+        settings.validate(&config).map_err(anyhow::Error::msg)?;
         let (commands, input) = mpsc::channel(128);
         let (output, effects) = mpsc::channel(128);
         let (shutdown, shutdown_requested) = oneshot::channel();
         let task = tokio::spawn(ivy::node::run_with_shutdown(
             listener,
             config,
-            CoreSettings {
-                listen_port: Some(address.port()),
-                ..CoreSettings::default()
-            },
+            settings,
             input,
             output,
             None,

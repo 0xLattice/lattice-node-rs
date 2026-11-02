@@ -426,3 +426,12 @@ snapshot sees the deletion. Existing real host and daemon mining/restart tests
 also pass. This ports the root preflight worker boundary from pinned Swift
 `NodeRuntime.swift`'s mining-job queue; root transitions, template building and
 child preflights remain separate scheduling work, not claimed asynchronous parity.
+
+### Explicit peer reconnect wiring
+
+Explicit operator peers now enter Ivy's configured bootstrap topology rather
+than a one-shot node dial. The existing Ivy backoff/reconnect implementation
+therefore handles initial refusals and peer process restarts. Named/fixed seed
+policy is unchanged. A two-host test keeps the author alive throughout initial
+parent absence and a later parent restart, verifying synchronization to the new
+block at the original address with default discovery timing.

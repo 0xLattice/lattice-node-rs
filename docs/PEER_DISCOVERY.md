@@ -23,8 +23,10 @@ Per-level progress high-water, stalled and low-peer clocks follow unchanged Swif
 node actor. There is at most one discovery/cache request per path, 64 outstanding
 requests overall, and four randomized candidate dials per completed lookup.
 Unhosting cancels outstanding requests; their late completions cannot reconnect
-that removed level. Configured root seeds retry at maintenance cadence when
-below the seed threshold or stalled; at most 64 are retried in a pass.
+that removed level. Explicit operator peers (`HostConfig.seeds`) are passed to
+Ivy as configured bootstrap peers: Ivy dials them initially and maintains them
+after failed dials or transport loss, with bounded exponential reconnect backoff.
+Conditional named/fixed seeds retain the maintenance threshold policy.
 
 A peer hosts a child if its compatible hello claims it or the authenticated Ivy
 provider cache names it. The additive Ivy `ProviderMemberships` request snapshots
@@ -124,3 +126,19 @@ Swift can contact it before the reconnected peers' hosted capabilities arrive.
 The Rust test's exact seed-suppression assertion describes its controlled fixture;
 it is not a claim that every Swift restart suppresses every seed dial. Reports
 and compiler/run logs stay under ignored `target/child-peer-memory-swift`.
+
+The explicit-peer restart regression starts an author before its sole configured
+parent exists, then checks initial-failure recovery, synchronization, parent
+restart at the same identity/address, and synchronization of a later block while
+the author stays alive. It uses the default 600-second discovery cadence and no
+named seeds. This closes a wiring gap: one-shot node dials did not register Ivy's
+configured-peer upkeep, and disconnected peers cannot become stalled search
+candidates. Pinned Swift `LatticeNodeCommand.swift` similarly places explicit
+operator peers in overlay `bootstrapPeers`; Ivy maintains those peers separately
+from conditional seed discovery.
+
+The original `lattice-ctl-rs/tools/child-integration.py` regression also passes
+with `author_restarted=false`: the parent restarts and rotates its RPC cookie,
+the author resumes the exact saved signed commitment, the parent consumes its
+nonce once, and the surviving author synchronizes the carrier and child premine.
+This checks the reported application-visible failure without restarting the author.

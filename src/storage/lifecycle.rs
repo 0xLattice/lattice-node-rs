@@ -14,9 +14,13 @@ impl StorageDirectoryLock {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
-        let file = options.open(directory.as_ref().join(".lattice-node.lock"))?;
+        let path = directory.as_ref().join(".lattice-node.lock");
+        let file = options.open(&path)?;
+        Self::lock_candidate(file, &path)
+    }
+    fn lock_candidate(file: File, path: &Path) -> Result<Self, StoreError> {
         file.try_lock_exclusive().map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 StoreError::DirectoryInUse
@@ -24,6 +28,19 @@ impl StorageDirectoryLock {
                 StoreError::Io(e)
             }
         })?;
+        // Wipe may have detached this directory after open but before flock.
+        // Never protect the new pathname with a lease on an obsolete inode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = file.metadata()?;
+            let current = std::fs::symlink_metadata(path)?;
+            if !current.is_file() || held.dev() != current.dev() || held.ino() != current.ino() {
+                return Err(StoreError::DirectoryInUse);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = path;
         Ok(Self { file })
     }
 }
@@ -122,5 +139,43 @@ impl NodeStore {
         }
         tx.commit()?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod directory_lock_tests {
+    use super::*;
+
+    #[test]
+    fn startup_descriptor_opened_before_wipe_cannot_lease_recreated_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("Nexus");
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join(".lattice-node.lock");
+        // Startup A pauses between opening its descriptor and taking flock.
+        let stale = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        let wipe = StorageDirectoryLock::acquire(&directory).unwrap();
+        let detached = temp.path().join("detached");
+        std::fs::rename(&directory, &detached).unwrap();
+        std::fs::remove_dir_all(&detached).unwrap();
+        drop(wipe);
+        let fresh = StorageDirectoryLock::acquire(&directory).unwrap();
+        // Startup A can flock its obsolete descriptor, but must fail validation.
+        assert!(matches!(
+            StorageDirectoryLock::lock_candidate(stale, &path),
+            Err(StoreError::DirectoryInUse)
+        ));
+        assert!(matches!(
+            StorageDirectoryLock::acquire(&directory),
+            Err(StoreError::DirectoryInUse)
+        ));
+        drop(fresh);
+        assert!(StorageDirectoryLock::acquire(&directory).is_ok());
     }
 }

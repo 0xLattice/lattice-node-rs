@@ -110,7 +110,7 @@ impl NodeStore {
             ));
         }
         let mut db = self.db.lock().unwrap();
-        let tx = db.transaction()?;
+        let tx = turn::transaction(&mut db, rusqlite::TransactionBehavior::Deferred)?;
         for item in &delta.journaled {
             tx.execute("INSERT OR IGNORE INTO local_mempool_transactions(transaction_cid,added_at) VALUES(?1,?2)",params![item.cid,item.added_at/1000])?;
         }

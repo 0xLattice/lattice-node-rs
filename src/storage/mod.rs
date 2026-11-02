@@ -9,6 +9,7 @@ use std::{
 };
 mod admission;
 mod header;
+mod turn;
 pub use admission::*;
 mod journal;
 mod lifecycle;
@@ -56,7 +57,7 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
 }
 pub struct NodeStore {
-    db: Mutex<Connection>,
+    db: turn::GatedConnection,
     pub nexus_genesis_cid: String,
 }
 impl NodeStore {
@@ -76,7 +77,7 @@ impl NodeStore {
         }
         db.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
         Ok(Self {
-            db: Mutex::new(db),
+            db: turn::GatedConnection::new(db),
             nexus_genesis_cid: genesis,
         })
     }
@@ -106,3 +107,6 @@ pub struct StreamCursor {
 
 mod retention;
 pub use retention::*;
+
+#[cfg(test)]
+mod turn_tests;

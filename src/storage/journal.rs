@@ -47,7 +47,7 @@ impl NodeStore {
             }
         }
         let mut db = self.db.lock().unwrap();
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = turn::transaction(&mut db, rusqlite::TransactionBehavior::Immediate)?;
         if !levels.is_empty() {
             tx.execute(
                 "INSERT OR IGNORE INTO core_meta(key,value) VALUES('log_id',?1)",

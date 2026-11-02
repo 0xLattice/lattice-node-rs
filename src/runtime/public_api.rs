@@ -235,18 +235,14 @@ async fn health(state: &PublicState, route: String) -> Response {
         // A request disappearing must not cancel the shared snapshot and make
         // every next caller start another actor request (Swift Task semantics).
         tokio::spawn(async move {
-            let result = match tokio::time::timeout(
-                Duration::from_secs(30),
-                backend.health(route),
-            )
-            .await
-            {
-                Ok(Ok(result)) => result,
-                _ => (
-                    503,
-                    serde_json::json!({"error":"health snapshot unavailable"}),
-                ),
-            };
+            let result =
+                match tokio::time::timeout(Duration::from_secs(30), backend.health(route)).await {
+                    Ok(Ok(result)) => result,
+                    _ => (
+                        503,
+                        serde_json::json!({"error":"health snapshot unavailable"}),
+                    ),
+                };
             let mut cache = shared.lock().await;
             cache.ready = Some((Instant::now(), result.0, result.1.clone()));
             cache.loading = None;
@@ -365,7 +361,9 @@ mod tests {
         gate: Arc<Semaphore>,
     }
     impl RpcBackend for Gated {
-    fn health(&self, route: String) -> api::RpcFuture { self.request(route, serde_json::json!({})) }
+        fn health(&self, route: String) -> api::RpcFuture {
+            self.request(route, serde_json::json!({}))
+        }
         fn request(&self, _: String, _: Value) -> api::RpcFuture {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let gate = self.gate.clone();

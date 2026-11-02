@@ -75,7 +75,7 @@ impl NodeStore {
     ) -> Result<StateCountChanges, StoreError> {
         let path = path_key(path)?;
         let mut db = self.db.lock().unwrap();
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = turn::transaction(&mut db, rusqlite::TransactionBehavior::Immediate)?;
         let mut result = StateCountChanges {
             entered: vec![],
             left: vec![],

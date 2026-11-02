@@ -101,7 +101,7 @@ impl Host {
                     },
                 );
                 let (core, effects) =
-                    DurableMiningCore::restore(state, self.storage.clone(), &path, now())?;
+                    DurableMiningCore::restore_level(state, self.storage.clone(), &path, now())?;
                 self.child_mining
                     .insert(path.clone(), ChildMining { core, parent_tip });
                 self.enqueue_child_mining(&path, effects);

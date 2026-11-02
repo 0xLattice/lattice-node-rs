@@ -219,8 +219,8 @@ fn root_executor_uses_authenticated_preflight_and_rejects_aba_completion() {
             }
         })
         .unwrap();
-    let stale = core
-        .execute_root_preflight(&job, chain.tree(), 2000)
+    let stale_task = core
+        .prepare_root_preflight(&job, chain.tree())
         .unwrap()
         .unwrap();
     let movement = |tip: String| {
@@ -234,6 +234,12 @@ fn root_executor_uses_authenticated_preflight_and_rejects_aba_completion() {
     core.step(movement("other".into()), 2100).unwrap();
     let jobs = core
         .step(movement(verified.block_cid().into()), 2200)
+        .unwrap();
+    // The prepared task owns its old immutable basis while the actor moves
+    // A -> B -> A. Running later cannot regain current admission authority.
+    let stale = std::thread::spawn(move || stale_task.run(2000))
+        .join()
+        .unwrap()
         .unwrap();
     assert!(
         core.complete_root_preflight(stale, 2200)

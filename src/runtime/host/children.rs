@@ -241,20 +241,24 @@ impl Host {
                     self.needs_fetch.remove(&cid);
                 }
                 BodyEffect::Connect(job) => {
-                    let parent = self.child_parent(&path)?;
-                    let core = self.levels.get_mut(&path).unwrap();
-                    let effects = core.run_connection(&job, &parent, now())?;
-                    if core.tree().is_executed(job.block_hash())
-                        || core.tree().is_excluded_root(job.block_hash())
-                    {
-                        self.needs_fetch.remove(job.block_hash());
-                    } else if !core.awaiting_parent().contains_key(job.block_hash()) {
-                        self.needs_fetch.insert(job.block_hash().into());
-                    }
-                    self.queue.push_back(Work::Child(path.clone(), effects));
-                    // Executed ancestry can advance while the header tip stays fixed.
-                    self.wake_children()?;
-                    self.child_proofs(&path)?;
+                    let storage = self.storage.clone();
+                    storage.atomic_fact_turn(|| -> anyhow::Result<()> {
+                        let parent = self.child_parent(&path)?;
+                        let core = self.levels.get_mut(&path).unwrap();
+                        let effects = core.run_connection(&job, &parent, now())?;
+                        if core.tree().is_executed(job.block_hash())
+                            || core.tree().is_excluded_root(job.block_hash())
+                        {
+                            self.needs_fetch.remove(job.block_hash());
+                        } else if !core.awaiting_parent().contains_key(job.block_hash()) {
+                            self.needs_fetch.insert(job.block_hash().into());
+                        }
+                        self.queue.push_back(Work::Child(path.clone(), effects));
+                        // Executed ancestry can advance while the header tip stays fixed.
+                        self.wake_children()?;
+                        self.child_proofs(&path)?;
+                        Ok(())
+                    })?;
                 }
             }
         }

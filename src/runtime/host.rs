@@ -9,11 +9,12 @@ pub use read_endpoints::ReadEndpointConfig;
 mod child_mining;
 mod children;
 mod configuration;
+mod health;
+mod preflight;
 mod proofs;
 mod reads;
 mod retention;
 mod validation;
-mod health;
 use super::network::{Network, NetworkEvent};
 use crate::{
     core::{
@@ -115,6 +116,7 @@ struct MinedReply {
     children: Vec<(String, String)>,
 }
 struct Host {
+    preflights: preflight::Preflights,
     health: health::PublishedHealth,
     read_endpoint_config: ReadEndpointConfig,
     chain: RootChainCore,
@@ -280,6 +282,7 @@ async fn start_inner(
     let (commands, input) = mpsc::channel(128);
     let health = health::PublishedHealth::default();
     let mut host = Host {
+        preflights: preflight::Preflights::default(),
         health: health.clone(),
         read_endpoint_config,
         chain,
@@ -332,6 +335,11 @@ impl Host {
         Ok(id)
     }
     fn enqueue(&mut self, effects: Vec<MiningEffect>) {
+        // Tip moves reissue preflights. Keep no old-epoch backlog while workers
+        // finish; live jobs remain fenced at their authenticated completion.
+        let epoch = self.mining.state().tip_epoch();
+        preflight::retain_epoch(&mut self.queue, epoch);
+
         self.queue.extend(
             effects
                 .into_iter()
@@ -430,6 +438,10 @@ impl Host {
             self.maintain_retention();
             self.maintain_discovery().await?;
             tokio::select! {
+             completion=self.preflights.next(), if self.preflights.active()=>{
+                let effects=self.mining.complete_root_preflight(completion?,now())?;
+                self.enqueue(effects);
+             },
              command=input.recv()=>match command {Some(Command::Request(route,body,reply))=>{self.api(route,body,reply)?},Some(Command::Volume(cid,reply))=>{let _=reply.send(self.storage.fetch_volume(&cid).and_then(operator::archive));},Some(Command::Shutdown)|None=>{let _=self.ledger.save();self.network.stop().await;return Ok(())}},
              event=self.network.next()=>match event?{Some(event)=>self.network_event(event).await?,None=>return Err(anyhow::anyhow!("Ivy stopped"))},
              _=timer.tick()=>{if self.last_ledger_save.elapsed()>=std::time::Duration::from_secs(30){let _=self.ledger.save();self.last_ledger_save=std::time::Instant::now();}self.network.tick().await?;let effects=self.chain.tick(now())?;self.queue.push_back(Work::Chain(effects));self.child_tick()?;}
@@ -623,6 +635,7 @@ impl Host {
         Ok(())
     }
     async fn drain(&mut self) -> anyhow::Result<()> {
+        let mut deferred_preflights = VecDeque::new();
         while let Some(work) = self.queue.pop_front() {
             match work {
    Work::ReadEndpoints(id,path)=>self.network.lookup_read_endpoints(id,path).await?,
@@ -646,16 +659,24 @@ impl Host {
      BodyEffect::Fetch(cid)=>{if !self.needs_fetch.contains(&cid)&&self.storage.fetch_volume(&cid).is_some(){let effects=self.chain.body_arrived(&cid,now());self.queue.push_back(Work::Chain(effects));}else{let id=self.id()?;self.fetches.insert(id,Fetch::Body(cid.clone()));self.network.fetch(id,cid,true,None).await?;}},
      BodyEffect::Cancel(cid)=>{let ids:Vec<_>=self.fetches.iter().filter_map(|(id,f)|matches!(f,Fetch::Body(root) if root==&cid).then_some(*id)).collect();for id in ids {self.fetches.remove(&id);self.network.cancel_fetch(id).await?;}self.needs_fetch.remove(&cid);},
      BodyEffect::Connect(job)=>{
+      let storage=self.storage.clone();
+      storage.atomic_fact_turn(|| -> anyhow::Result<()> {
       let effect=match self.chain.tree().execute_root_connection(&job,self.storage.as_ref(),now())? {
        lattice_block_tree::RootConnectionExecution::Accepted(verified)=>{self.needs_fetch.remove(job.block_hash());let effects=self.chain.connected_root(&verified,now())?;if let Some(block)=verified.header().0.node.as_ref()&& let Some(children)=block.children.node.as_ref(){self.executed_children.extend(children.keys().cloned());}effects},
        lattice_block_tree::RootConnectionExecution::Rejected(rejected)=>self.chain.connected_rejected(rejected,now())?,
        lattice_block_tree::RootConnectionExecution::Unavailable=>{self.needs_fetch.insert(job.block_hash().into());self.chain.body_unavailable(job.block_hash(),now())},
       };self.queue.push_back(Work::Chain(effect));self.tip_changed()?;self.wake_children()?;
+      Ok(())
+      })?;
      }
     }}
    },
    Work::Mining(effect)=>match *effect {
-    MiningEffect::Preflight(job)=>if let Some(completion)=self.mining.execute_root_preflight(&job,self.chain.tree(),now())?{let effects=self.mining.complete_root_preflight(completion,now())?;self.enqueue(effects);},
+    MiningEffect::Preflight(job)=>{
+     if job.tip_epoch != self.mining.state().tip_epoch(){continue;}
+     if self.preflights.full(){deferred_preflights.push_back(Work::Mining(Box::new(MiningEffect::Preflight(job))));continue;}
+     if let Some(task)=self.mining.prepare_root_preflight(&job,self.chain.tree())?{self.preflights.start(task);}
+    },
     MiningEffect::BuildTemplate(job)=>{
      let anchor=self.chain.tree().difficulty_anchor(&job.tip_cid).map(|a|lattice_validation::DifficultyAnchor{block_height:a.block_height,timestamp:a.timestamp,target:UInt256(a.target)});
      let contexts=self.child_templates(&job.tip_cid)?;
@@ -669,8 +690,11 @@ impl Host {
     MiningEffect::Mined(id,block)=>{
      let cid=content_id(&block)?;let header=Volume::new(block.clone())?;let volumes=lattice_cashew::volume::serialize_recursive(&header,&())?;let scope=format!("mined-{cid}");self.storage.cache_volumes(&scope,&volumes)?;self.transient.push(scope);
      let children=block.children.resolve(self.storage.as_ref(),None)?.node.as_deref().unwrap().clone();
-     let effects=self.chain.admit_header(&block,&children,now())?;self.queue.push_back(Work::Chain(effects));
-     let child_proofs=self.mined_children(&block)?;
+     let storage=self.storage.clone();
+     let child_proofs=storage.atomic_fact_turn(|| -> anyhow::Result<_> {
+      let effects=self.chain.admit_header(&block,&children,now())?;self.queue.push_back(Work::Chain(effects));
+      self.mined_children(&block)
+     })?;
      // Reply is deferred until the queued body import crosses the journal barrier.
      self.mined_replies.push(MinedReply{id,cid,children:child_proofs});
     },
@@ -704,6 +728,11 @@ impl Host {
             }
             self.reply(id,(200,json!({"accepted":accepted,"disposition":disposition,"tipCID":self.chain.tree().executed_prefix(),"durableChildProofs":durable_children})));
         }
+        // A later effect in this same drain can move the tip after a full
+        // worker pool deferred an earlier preflight. Prune that local backlog
+        // too; enqueue's pruning can only see self.queue.
+        preflight::retain_epoch(&mut deferred_preflights, self.mining.state().tip_epoch());
+        self.queue.extend(deferred_preflights);
         for scope in std::mem::take(&mut self.transient) {
             self.storage.release_cached_volumes(&scope)?;
         }

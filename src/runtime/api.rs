@@ -166,7 +166,10 @@ async fn authorized(state: &ApiState, request: Request) -> Response {
     let path = request.uri().path().to_owned();
     let method = request.method().clone();
     if path == "/health" && (method == Method::GET || method == Method::HEAD) {
-        let route = request.uri().query().map_or_else(|| "/status".into(), |q| format!("/status?{q}"));
+        let route = request
+            .uri()
+            .query()
+            .map_or_else(|| "/status".into(), |q| format!("/status?{q}"));
         let mut response = health_response(&state.backend, route).await;
         super::read_cache::apply(&mut response, &method, &path);
         if method == Method::HEAD {
@@ -388,8 +391,13 @@ pub(super) fn bounded_json(status: StatusCode, value: &Value, maximum: usize) ->
 pub(super) async fn health_response(backend: &Arc<dyn RpcBackend>, route: String) -> Response {
     match tokio::time::timeout(Duration::from_secs(30), backend.health(route)).await {
         Ok(Ok((code, value))) => bounded_json(
-            StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), &value, 4 << 20,
+            StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &value,
+            4 << 20,
         ),
-        _ => error(StatusCode::SERVICE_UNAVAILABLE, "health snapshot unavailable"),
+        _ => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "health snapshot unavailable",
+        ),
     }
 }

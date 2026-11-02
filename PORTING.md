@@ -390,3 +390,39 @@ all child books before maintenance begins, including child-only seed starts.
 Child seeds follow remembered/provider stages and the peer threshold; successful
 dials populate ancestry books. A four-host restart test verifies seed-update
 suppression, child-book retention, remembered-peer priority, fallback and isolation.
+
+### Asynchronous root transaction preflight
+
+Root transaction preflight now captures its executed-tip/epoch authority on the
+actor and executes on at most four blocking workers (also capped by available
+parallelism). The private-input task alone produces the authenticated completion;
+the actor rechecks its epoch and immutable context before durable pool admission.
+Queued old-epoch jobs are removed, including A-to-B-to-A changes. When workers are
+full, preflight effects remain in the existing reducer work queue while other
+queued effects, commands and transport events continue. This adds no unbounded
+`spawn_blocking` backlog and no duplicate prepared-task queue. Pending transaction
+and pool limits remain the reducer's existing limits; this is not a new global
+byte budget across every host work queue.
+
+Each prepared task owns a read-only SQLite WAL content snapshot, fixed before
+offload under the storage turn gate. It sees complete authenticated volume entries
+as of that committed turn, including content later deleted by retention, and
+cannot see later writes. This avoids walking/copying all held roots. Each snapshot
+uses a 1 MiB SQLite page-cache target; only running jobs create snapshots. The
+blocking closure owns both snapshot and node-directory lifetime, so dropping its
+join handle does not release content while work continues. Completion, error and
+panic release those leases. Cancellation of a running blocking task is not
+preemptive; existing transaction-size/policy-gas limits apply, and shutdown can
+leave a bounded number of workers finishing. WAL history can grow while a read
+snapshot lives; no additional absolute WAL-byte or wall-clock bound is claimed.
+
+`tests/mining_store.rs` runs a sealed prepared task on another thread after an
+A-to-B-to-A tip change and verifies that its completion cannot admit a transaction.
+The worker test saturates the pool while the single-thread runtime continues,
+then verifies cancellation retains ownership until the workers actually exit.
+VolumeBroker's real WAL test deletes old content and inserts new content on a
+concurrent writer: the old snapshot retains only its original view, and a fresh
+snapshot sees the deletion. Existing real host and daemon mining/restart tests
+also pass. This ports the root preflight worker boundary from pinned Swift
+`NodeRuntime.swift`'s mining-job queue; root transitions, template building and
+child preflights remain separate scheduling work, not claimed asynchronous parity.

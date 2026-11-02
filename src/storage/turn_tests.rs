@@ -1,0 +1,450 @@
+//! Real authenticated header imports exercise the production turn boundary.
+use super::*;
+use lattice_block_tree::{ChainTree, ChildBlockProof};
+use lattice_cashew::{Header, MerkleDictionary, Volume};
+use lattice_primitives::*;
+use std::sync::Arc;
+fn root() -> Block {
+    let empty = Volume::new(LatticeState::empty().unwrap()).unwrap();
+    Block {
+        version: 1,
+        parent: None,
+        transactions: Header::new(MerkleDictionary::default()).unwrap(),
+        target: UInt256([255; 32]),
+        next_target: UInt256([255; 32]),
+        spec: Volume::new(ChainSpec {
+            max_number_of_transactions_per_block: 100,
+            max_state_growth: 100_000,
+            max_block_size: 1_000_000,
+            premine: 0,
+            target_block_time: 1000,
+            initial_reward: 1024,
+            halving_interval: 210_000,
+            half_life: 120,
+            wasm_policies: vec![],
+        })
+        .unwrap(),
+        parent_state: empty.clone(),
+        prev_state: empty.clone(),
+        post_state: empty,
+        children: Header::new(BTreeMap::new()).unwrap(),
+        height: 0,
+        timestamp: 1000,
+        reward_recipient: None,
+        nonce: 0,
+    }
+}
+
+fn funded(path: &[&str]) -> Block {
+    let mut block = root();
+    let mut spec = block.spec.0.node.as_deref().unwrap().clone();
+    spec.premine = 1;
+    block.spec = Volume::new(spec).unwrap();
+    let body = TransactionBody {
+        account_actions: vec![AccountAction {
+            owner: "alice".into(),
+            delta: 100,
+        }],
+        actions: vec![],
+        deposit_actions: vec![],
+        receipt_actions: vec![],
+        withdrawal_actions: vec![],
+        signers: vec![],
+        nonce: 0,
+        chain_path: path.iter().map(|s| (*s).into()).collect(),
+    };
+    block.transactions = Header::new(
+        MerkleDictionary::default()
+            .inserting(
+                "0",
+                Volume::new(Transaction {
+                    body: Header::new(body).unwrap(),
+                    signatures: BTreeMap::new(),
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let mut state = LatticeState::empty().unwrap();
+    state.account_state =
+        Volume::new(AccountState::default().inserting("alice", 100).unwrap()).unwrap();
+    block.post_state = Volume::new(state).unwrap();
+    block
+}
+
+fn fixture(directory: &Path) -> (Arc<NodeStorage>, ChainTree, ChainTree, Block, Block, Block) {
+    let genesis = funded(&["Nexus"]);
+    let genesis_cid = content_id(&genesis).unwrap();
+    let storage = Arc::new(NodeStorage::open(directory, &genesis_cid, "atomic").unwrap());
+    let verified = lattice_validation::validate_root_genesis(
+        &Volume::new(genesis.clone()).unwrap(),
+        &BTreeMap::<String, Vec<u8>>::new(),
+        i64::MAX,
+    )
+    .unwrap();
+    let mut root = ChainTree::empty(
+        ChainRuntimeContext::new(vec!["Nexus".into()], Some(&genesis_cid)).unwrap(),
+    );
+    storage
+        .import_root_genesis(&mut root, &verified, "atomic")
+        .unwrap();
+    root.hold_spec(
+        genesis.spec.0.node.as_deref().unwrap().clone(),
+        &genesis.spec.0.raw_cid,
+    );
+    root.serve_runs("Alpha");
+    let mut child = funded(&["Nexus", "Alpha"]);
+    child.parent_state = genesis.post_state.clone();
+    let mut carrier = genesis.clone();
+    carrier.parent = Some(Volume::new(genesis.clone()).unwrap());
+    carrier.height = 1;
+    carrier.timestamp = 2000;
+    carrier.prev_state = genesis.post_state.clone();
+    carrier.children = Header::new(BTreeMap::from([(
+        "Alpha".into(),
+        Volume::new(child.clone()).unwrap(),
+    )]))
+    .unwrap();
+    let child_tree = ChainTree::empty(
+        ChainRuntimeContext::new(vec!["Nexus".into(), "Alpha".into()], None).unwrap(),
+    );
+    (storage, root, child_tree, genesis, carrier, child)
+}
+fn import_parent(
+    storage: &NodeStorage,
+    tree: &mut ChainTree,
+    block: &Block,
+) -> Result<(), StoreError> {
+    let volumes = lattice_cashew::volume::serialize_recursive(&Volume::new(block.clone())?, &())?;
+    storage.cache_volumes("turn-content", &volumes)?;
+    storage.import_root_header(
+        tree,
+        block,
+        block.children.node.as_deref().unwrap(),
+        2000,
+        "atomic",
+    )?;
+    Ok(())
+}
+fn import_child(
+    storage: &NodeStorage,
+    tree: &mut ChainTree,
+    carrier: &Block,
+    child: &Block,
+) -> Result<(), StoreError> {
+    let proof = ChildBlockProof::generate(&content_id(carrier)?, "Alpha", storage)?;
+    storage.import_child_genesis_header(
+        tree,
+        child,
+        child.children.node.as_deref().unwrap(),
+        child.spec.0.node.as_deref().unwrap(),
+        &proof,
+        "atomic",
+    )?;
+    Ok(())
+}
+fn assert_recovered(
+    directory: &Path,
+    genesis: &Block,
+    carrier: &Block,
+    child: &Block,
+    committed: bool,
+) {
+    let genesis_cid = content_id(genesis).unwrap();
+    let storage = NodeStorage::open(directory, &genesis_cid, "atomic").unwrap();
+    let (mut tree, _) = storage
+        .journal()
+        .restore_chain(
+            ChainRuntimeContext::new(vec!["Nexus".into()], Some(&genesis_cid)).unwrap(),
+            None,
+            vec![genesis.spec.0.node.as_deref().unwrap().clone()],
+        )
+        .unwrap();
+    tree.serve_runs("Alpha");
+    assert_eq!(tree.contains(&content_id(carrier).unwrap()), committed);
+    let path = vec!["Nexus".into(), "Alpha".into()];
+    let storage = Arc::new(storage);
+    let level = crate::core::levels::ChildChainCore::open(
+        storage.clone(),
+        ChainRuntimeContext::new(path.clone(), None).unwrap(),
+        &tree,
+        vec![child.spec.0.node.as_deref().unwrap().clone()],
+        "atomic",
+        crate::core::stream::StreamConfig::default(),
+        8,
+    )
+    .unwrap();
+    assert_eq!(
+        level.tree().contains(&content_id(child).unwrap()),
+        committed
+    );
+    assert_eq!(
+        !storage
+            .journal()
+            .saved_proofs(&path, &[content_id(child).unwrap()])
+            .unwrap()
+            .is_empty(),
+        committed
+    );
+}
+#[test]
+fn failed_second_level_rolls_back_parent_and_child_and_same_handle_observers() {
+    for fail in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let (storage, mut root, mut level, genesis, carrier, child) = fixture(directory.path());
+        if fail {
+            storage.journal().db.lock().unwrap().execute_batch("CREATE TEMP TRIGGER reject_child BEFORE INSERT ON admission_batches WHEN NEW.chain_path='Nexus/Alpha' BEGIN SELECT RAISE(ABORT,'injected child journal failure'); END;").unwrap();
+        }
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let observed = storage.clone();
+        let observer = std::thread::spawn(move || {
+            started_rx.recv().unwrap();
+            let root = observed
+                .journal()
+                .import_batches(&["Nexus".into()])
+                .unwrap();
+            let child = observed
+                .journal()
+                .import_batches(&["Nexus".into(), "Alpha".into()])
+                .unwrap();
+            observed_tx.send((root.len(), child.len())).unwrap();
+        });
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        let (written_tx, written_rx) = std::sync::mpsc::channel();
+        let writer_storage = storage.clone();
+        let writer = std::thread::spawn(move || {
+            write_rx.recv().unwrap();
+            // Both retention and journal entry contend on the SAME storage.
+            writer_storage
+                .persist_materialized_batch(
+                    &[NodeFactBatch {
+                        path: vec!["Nexus".into(), "Other".into()],
+                        facts: vec![],
+                        headers: vec![],
+                        proofs: vec![],
+                        volume_roots: vec![],
+                        cursors: BTreeMap::from([(
+                            "observer-peer".into(),
+                            StreamCursor {
+                                log_id: "external".into(),
+                                position: 7,
+                            },
+                        )]),
+                    }],
+                    &[],
+                    "atomic",
+                )
+                .unwrap();
+            written_tx.send(()).unwrap();
+        });
+        let before = storage
+            .journal()
+            .import_batches(&["Nexus".into()])
+            .unwrap()
+            .len();
+        let result: Result<(), StoreError> = storage.atomic_fact_turn(|| {
+            import_parent(&storage, &mut root, &carrier)?;
+            assert!(storage.journal().header(&content_id(&carrier)?)?.is_some());
+            started_tx.send(()).unwrap();
+            write_tx.send(()).unwrap();
+            assert!(observed_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            assert!(written_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            import_child(&storage, &mut level, &carrier, &child)?;
+            Ok(())
+        });
+        assert_eq!(result.is_err(), fail);
+        let (roots, children) = observed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(roots > before, !fail);
+        assert_eq!(children > 0, !fail);
+        written_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        observer.join().unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            storage
+                .journal()
+                .chain_cursors(&["Nexus".into(), "Other".into()])
+                .unwrap()["observer-peer"]
+                .position,
+            7
+        );
+        // Provisional in-memory trees are intentionally discarded on failure.
+        drop(storage);
+        drop(root);
+        drop(level);
+        assert_recovered(directory.path(), &genesis, &carrier, &child, !fail);
+    }
+}
+#[test]
+fn atomic_turn_crash_child() {
+    let Ok(directory) = std::env::var("LATTICE_ATOMIC_TEST_DIRECTORY") else {
+        return;
+    };
+    let after = std::env::var("LATTICE_ATOMIC_TEST_AFTER").unwrap() == "true";
+    let (storage, mut root, mut level, _, carrier, child) = fixture(Path::new(&directory));
+    let result: Result<(), StoreError> = storage.atomic_fact_turn(|| {
+        import_parent(&storage, &mut root, &carrier)?;
+        import_child(&storage, &mut level, &carrier, &child)?;
+        if !after {
+            std::process::exit(77);
+        }
+        Ok(())
+    });
+    result.unwrap();
+    std::process::exit(78);
+}
+#[test]
+fn abrupt_process_exit_exposes_all_levels_or_none_on_recovery() {
+    for after in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage::turn_tests::atomic_turn_crash_child",
+                "--nocapture",
+            ])
+            .env("LATTICE_ATOMIC_TEST_DIRECTORY", directory.path())
+            .env("LATTICE_ATOMIC_TEST_AFTER", after.to_string())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(if after { 78 } else { 77 }));
+        // Derive identical fixture identifiers in a separate disposable store.
+        let identifiers = tempfile::tempdir().unwrap();
+        let (storage, _, _, genesis, carrier, child) = fixture(identifiers.path());
+        drop(storage);
+        assert_recovered(directory.path(), &genesis, &carrier, &child, after);
+    }
+}
+
+#[test]
+fn deferred_retention_preserves_previous_state_on_failure_and_later_readds() {
+    use lattice_volume_broker::RetainedRootBroker;
+    let directory = tempfile::tempdir().unwrap();
+    let (storage, _, _, _, _, _) = fixture(directory.path());
+    let a = Volume::new(1u64).unwrap();
+    let b = Volume::new(2u64).unwrap();
+    let mut volumes = lattice_cashew::volume::serialize_recursive(&a, &()).unwrap();
+    volumes.extend(lattice_cashew::volume::serialize_recursive(&b, &()).unwrap());
+    storage
+        .cache_volumes("retention-fixture", &volumes)
+        .unwrap();
+    let a = [a.0.raw_cid].into_iter().collect();
+    let b = [b.0.raw_cid].into_iter().collect();
+    let path = vec!["Nexus".into()];
+    let scope = RetentionScopes {
+        chain: "atomic".into(),
+    }
+    .state(&path);
+    storage
+        .retain_execution_content(StateRetention::None, &path, &a, &Default::default())
+        .unwrap();
+    let result: Result<(), StoreError> = storage.atomic_fact_turn(|| {
+        storage.retain_execution_content(StateRetention::None, &path, &b, &Default::default())?;
+        storage.retain_execution_content(StateRetention::None, &path, &a, &Default::default())?;
+        Ok(())
+    });
+    result.unwrap();
+    assert_eq!(storage.broker.retained_roots(&scope).unwrap(), a);
+    let result: Result<(), StoreError> = storage.atomic_fact_turn(|| {
+        storage.retain_execution_content(StateRetention::None, &path, &b, &Default::default())?;
+        Err(StoreError::Corrupt(
+            "injected failure after retention".into(),
+        ))
+    });
+    assert!(result.is_err());
+    assert!(a.is_subset(&storage.broker.retained_roots(&scope).unwrap()));
+}
+
+#[test]
+fn child_activation_preserves_other_levels_pins_and_rollback_restores_local_rows() {
+    use crate::core::{
+        mempool::MempoolItem,
+        mining::{DurableMiningCore, MiningConfig, MiningState, PoolDelta},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let (storage, _, _, _, _, child) = fixture(directory.path());
+    let item = |nonce| {
+        let tx = Transaction::new(
+            BTreeMap::new(),
+            Header::new(TransactionBody {
+                account_actions: vec![AccountAction {
+                    owner: "alice".into(),
+                    delta: -1,
+                }],
+                actions: vec![],
+                deposit_actions: vec![],
+                receipt_actions: vec![],
+                withdrawal_actions: vec![],
+                signers: vec!["alice".into()],
+                nonce,
+                chain_path: vec!["Nexus".into()],
+            })
+            .unwrap(),
+        );
+        MempoolItem {
+            cid: content_id(&tx).unwrap(),
+            transaction: tx,
+            added_at: 2000,
+        }
+    };
+    let local = item(0);
+    let volatile = item(1);
+    storage
+        .persist_pool_delta(&PoolDelta {
+            added: vec![local.clone(), volatile.clone()],
+            journaled: vec![local.clone()],
+            removed: vec![],
+        })
+        .unwrap();
+    let before = storage.live_mempool_roots().unwrap();
+    assert_eq!(before.len(), 2);
+    let activate = || {
+        DurableMiningCore::restore_level(
+            MiningState::new(
+                content_id(&child).unwrap(),
+                Some(child.spec.0.node.as_deref().unwrap().clone()),
+                MiningConfig::default(),
+            ),
+            storage.clone(),
+            &["Nexus".into(), "Alpha".into()],
+            2000,
+        )
+    };
+    let success: Result<(), StoreError> = storage.atomic_fact_turn(|| {
+        let (_, effects) = activate()?;
+        assert!(effects.is_empty());
+        assert_eq!(storage.live_mempool_roots()?, before);
+        Ok(())
+    });
+    success.unwrap();
+    assert_eq!(storage.live_mempool_roots().unwrap(), before);
+    let failed: Result<(), StoreError> = storage.atomic_fact_turn(|| {
+        storage.persist_pool_delta(&PoolDelta {
+            added: vec![],
+            journaled: vec![],
+            removed: vec![local.cid.clone()],
+        })?;
+        assert!(storage.journal().local_mempool_transactions()?.is_empty());
+        let _ = activate()?;
+        // Even accidental future use of startup reconciliation cannot release
+        // the old committed pool's owners inside a provisional turn.
+        assert!(storage.reconcile_mempool_roots().is_err());
+        Err(StoreError::Corrupt(
+            "injected activation turn failure".into(),
+        ))
+    });
+    assert!(failed.is_err());
+    assert_eq!(storage.live_mempool_roots().unwrap(), before);
+    assert_eq!(
+        storage.journal().local_mempool_transactions().unwrap()[0].transaction_cid,
+        local.cid
+    );
+    assert!(storage.fetch_volume(&local.cid).is_some());
+    // Process startup still drops volatile owners and retains durable rows.
+    storage.reconcile_mempool_roots().unwrap();
+    assert_eq!(
+        storage.live_mempool_roots().unwrap(),
+        [local.cid].into_iter().collect()
+    );
+}

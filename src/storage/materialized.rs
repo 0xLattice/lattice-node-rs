@@ -6,11 +6,12 @@ use lattice_volume_broker::{
 /// This is a storage executor, not network block admission.
 pub struct NodeStorage {
     // Drop storage connections before releasing the directory lock.
-    store: NodeStore,
-    broker: DiskBroker,
+    pub(super) store: NodeStore,
+    pub(super) broker: DiskBroker,
     scope: String,
     retention: RetentionPolicy,
-    turn: Mutex<()>,
+    pub(super) turn: turn::TurnGate,
+    pub(super) turn_releases: Mutex<Option<Vec<(String, Roots)>>>,
     _directory_lock: StorageDirectoryLock,
 }
 impl NodeStorage {
@@ -50,9 +51,18 @@ impl NodeStorage {
             store,
             broker,
             scope,
-            turn: Mutex::new(()),
+            turn: turn::TurnGate::new(),
+            turn_releases: Mutex::new(None),
             _directory_lock: lock,
         })
+    }
+    /// Snapshot content under the same turn gate as content/journal commits.
+    /// The caller owns this read lease until its bounded validation work ends.
+    pub(crate) fn preflight_snapshot(
+        &self,
+    ) -> Result<lattice_volume_broker::DiskReadSnapshot, StoreError> {
+        let _turn = self.turn.lock().unwrap();
+        Ok(self.broker.read_snapshot()?)
     }
     pub fn retention_policy(&self) -> RetentionPolicy {
         self.retention
@@ -127,9 +137,9 @@ impl NodeStorage {
         self.broker
             .store_volumes_local(&volumes.into_values().collect::<Vec<_>>())?;
         self.broker.merge_retained_roots(&scope, &roots)?;
+        self.retained_again(&scope, &roots);
         self.store.apply_pool_journal(delta)?;
-        self.broker
-            .release_retained_roots(&scope, &delta.removed.iter().cloned().collect())?;
+        self.release_after_fact_commit(&scope, &delta.removed.iter().cloned().collect())?;
         Ok(())
     }
     pub fn live_mempool_roots(&self) -> Result<Roots, StoreError> {
@@ -167,6 +177,11 @@ impl NodeStorage {
     /// public-submitted entries were volatile. Other held-state scopes remain.
     pub fn reconcile_mempool_roots(&self) -> Result<(), StoreError> {
         let _turn = self.turn.lock().unwrap();
+        if self.turn_releases.lock().unwrap().is_some() {
+            return Err(StoreError::InvalidConfiguration(
+                "mempool reconciliation is startup-only, outside fact turns".into(),
+            ));
+        }
         let roots = self
             .store
             .local_mempool_transactions()?
@@ -298,6 +313,7 @@ impl NodeStorage {
             .cloned()
             .collect();
         self.broker.merge_retained_roots(scope, &held)?;
+        self.retained_again(scope, &held);
         Ok(())
     }
     /// Body roots must all exist; state/spec read roots that are locally absent
@@ -345,7 +361,7 @@ impl NodeStorage {
                 let scope = scopes.state(path);
                 let previous = self.broker.retained_roots(&scope)?;
                 self.retain_held_locked(&scope, states)?;
-                self.broker.release_retained_roots(
+                self.release_after_fact_commit(
                     &scope,
                     &previous.difference(states).cloned().collect(),
                 )?;
@@ -589,11 +605,9 @@ impl NodeStorage {
                 .difference(&state_roots)
                 .cloned()
                 .collect();
-            let _ = self
-                .broker
-                .release_retained_roots(&scopes.state(&level.path), &gone);
+            let _ = self.release_after_fact_commit(&scopes.state(&level.path), &gone);
         }
-        let _ = self.broker.release_retained_roots(&root_reads, &supplied);
+        let _ = self.release_after_fact_commit(&root_reads, &supplied);
         Ok(())
     }
 }

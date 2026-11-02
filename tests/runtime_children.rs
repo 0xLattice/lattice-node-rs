@@ -290,14 +290,22 @@ async fn hosted_actor_syncs_proof_bound_child_and_recovers() {
     );
     drop(reopened);
     let restored = lattice_node::runtime::host::start_with_hosted_configuration(
-        config(other.path().into(), 82, vec![]), Default::default(), Default::default(), Default::default(),
+        config(other.path().into(), 82, vec![]),
+        Default::default(),
+        Default::default(),
+        Default::default(),
         json!({"hostChain":["Nexus/Alpha"]}),
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
     let health = restored.handle.health("/health?chainPath=Nexus/Alpha");
     assert_eq!(health.0, 200);
     assert_eq!(health.1["tipCID"], child_cid);
     assert_eq!(health.1["height"], "0");
-    assert_eq!(restored.handle.health("/health?chainPath=Nexus/Beta").0, 404);
+    assert_eq!(
+        restored.handle.health("/health?chainPath=Nexus/Beta").0,
+        404
+    );
     assert_eq!(
         restored
             .handle

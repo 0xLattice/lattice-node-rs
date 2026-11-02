@@ -794,6 +794,42 @@ pub struct RootPreflightCompletion {
     job: PreflightJob,
     result: lattice_validation::TransactionPreflightResult,
 }
+/// Immutable, private-input executor with a WAL content lease. Field order
+/// closes the snapshot before releasing the node directory ownership.
+pub struct RootPreflightTask {
+    job: PreflightJob,
+    path: Vec<String>,
+    snapshot: lattice_volume_broker::DiskReadSnapshot,
+    _storage: std::sync::Arc<crate::storage::NodeStorage>,
+}
+impl RootPreflightTask {
+    pub fn run(self, now: i64) -> Result<RootPreflightCompletion, crate::storage::StoreError> {
+        struct Source<'a>(&'a lattice_volume_broker::DiskReadSnapshot);
+        impl lattice_cashew::ContentSource for Source<'_> {
+            fn fetch(&self, cid: &str) -> Result<Vec<u8>, lattice_cashew::Error> {
+                self.0
+                    .fetch_data(&[cid.to_owned()].into_iter().collect())
+                    .ok()
+                    .and_then(|mut rows| rows.remove(cid))
+                    .ok_or_else(|| lattice_cashew::Error::MissingContent(cid.into()))
+            }
+        }
+        let tip = lattice_cashew::Volume(lattice_cashew::Header::from_cid(&self.job.tip_cid)?);
+        let result = lattice_validation::TransactionPreflight {
+            transaction: &self.job.transaction,
+            tip: &tip,
+            chain_path: &self.path,
+            parent_state: None,
+            now_milliseconds: now,
+            checks_policies: self.job.checks_policies,
+        }
+        .classify(&Source(&self.snapshot))?;
+        Ok(RootPreflightCompletion {
+            job: self.job,
+            result,
+        })
+    }
+}
 impl DurableMiningCore {
     /// `None` means stale work; the tip move issues replacement jobs. Missing
     /// content is classified Unavailable by the composed validator.
@@ -803,6 +839,17 @@ impl DurableMiningCore {
         tree: &lattice_block_tree::ChainTree,
         now: i64,
     ) -> Result<Option<RootPreflightCompletion>, crate::storage::StoreError> {
+        self.prepare_root_preflight(job, tree)?
+            .map(|task| task.run(now))
+            .transpose()
+    }
+    /// Captures graph authority on the actor. Only this constructor can prepare
+    /// a task; the worker cannot supply a different tip or admission result.
+    pub fn prepare_root_preflight(
+        &self,
+        job: &PreflightJob,
+        tree: &lattice_block_tree::ChainTree,
+    ) -> Result<Option<RootPreflightTask>, crate::storage::StoreError> {
         let Some(context) = tree.context().filter(|c| c.path().len() == 1) else {
             return Ok(None);
         };
@@ -813,19 +860,11 @@ impl DurableMiningCore {
         {
             return Ok(None);
         }
-        let tip = lattice_cashew::Volume(lattice_cashew::Header::from_cid(&job.tip_cid)?);
-        let result = lattice_validation::TransactionPreflight {
-            transaction: &job.transaction,
-            tip: &tip,
-            chain_path: context.path(),
-            parent_state: None,
-            now_milliseconds: now,
-            checks_policies: job.checks_policies,
-        }
-        .classify(self.storage.as_ref())?;
-        Ok(Some(RootPreflightCompletion {
+        Ok(Some(RootPreflightTask {
             job: job.clone(),
-            result,
+            path: context.path().to_vec(),
+            snapshot: self.storage.preflight_snapshot()?,
+            _storage: self.storage.clone(),
         }))
     }
     pub fn complete_root_preflight(
@@ -870,6 +909,26 @@ impl DurableMiningCore {
     ) -> Result<(Self, Vec<MiningEffect>), crate::storage::StoreError> {
         let items = storage.restored_mempool_items()?;
         storage.reconcile_mempool_roots()?;
+        Self::restore_items(state, storage, chain_path, now, items)
+    }
+    /// Activate one hosted level without replacing other live levels' pins.
+    /// The process startup boundary alone reconciles the global pool scope.
+    pub(crate) fn restore_level(
+        state: MiningState,
+        storage: std::sync::Arc<crate::storage::NodeStorage>,
+        chain_path: &[String],
+        now: i64,
+    ) -> Result<(Self, Vec<MiningEffect>), crate::storage::StoreError> {
+        let items = storage.restored_mempool_items()?;
+        Self::restore_items(state, storage, chain_path, now, items)
+    }
+    fn restore_items(
+        state: MiningState,
+        storage: std::sync::Arc<crate::storage::NodeStorage>,
+        chain_path: &[String],
+        now: i64,
+        items: Vec<crate::core::mempool::MempoolItem>,
+    ) -> Result<(Self, Vec<MiningEffect>), crate::storage::StoreError> {
         let mut core = Self::new(state, storage);
         let mut effects = Vec::new();
         for item in items {

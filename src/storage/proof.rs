@@ -30,7 +30,7 @@ impl NodeStore {
         }
         let chain = path_key(path)?;
         let mut db = self.db.lock().unwrap();
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = turn::transaction(&mut db, rusqlite::TransactionBehavior::Immediate)?;
         let mut result = BTreeMap::<String, Vec<ChildBlockProof>>::new();
         let mut bad = vec![];
         for chunk in children.chunks(500) {

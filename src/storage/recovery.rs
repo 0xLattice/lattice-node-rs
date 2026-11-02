@@ -14,7 +14,7 @@ impl NodeStore {
     pub fn recovery_snapshot(&self, path: &[String]) -> Result<ChainRecoverySnapshot, StoreError> {
         let path = path_key(path)?;
         let mut db = self.db.lock().unwrap();
-        let tx = db.transaction()?;
+        let tx = turn::transaction(&mut db, rusqlite::TransactionBehavior::Deferred)?;
         let mut batches = vec![];
         let mut after = 0;
         loop {

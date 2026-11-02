@@ -22,7 +22,12 @@ impl StorageDirectoryLock {
     }
     fn lock_candidate(file: File, path: &Path) -> Result<Self, StoreError> {
         file.try_lock_exclusive().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
+            // fs2 uses ERROR_LOCK_VIOLATION on Windows, which is not
+            // classified as WouldBlock by std::io. Compare its platform code.
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || (e.raw_os_error().is_some()
+                    && e.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+            {
                 StoreError::DirectoryInUse
             } else {
                 StoreError::Io(e)

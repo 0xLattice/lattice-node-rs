@@ -7,7 +7,7 @@ from 0xLattice/lattice-node at `3df9e0a786c7b103a3da88d1c3881efc81706255`,
 `build_merged_template` consumes a root job plus per-path `ChildTemplateContext`
 snapshots. The host must select each child's extendable executed ancestor for
 its carrier's entering state and fence completion against every affected level's
-tip, pool, hosting configuration and session. Inputs are ordinary work data;
+tip, epoch, pool and hosting configuration. Inputs are ordinary work data;
 neither construction nor fitting grants admission or securing-work authority.
 Mined children still need actual authenticated proofs and private validation.
 
@@ -46,3 +46,31 @@ best header tips and pools in Swift's depth-then-joined-path order, even when a
 candidate waits or is omitted. Completion still requires epoch fencing.
 Daemon configuration, scheduling and end-to-end child mining must be validated
 at their integration boundary before claiming complete hosted-child support.
+
+The `/mining/templates` actor path runs assembly in the same bounded blocking
+pool as root/child transaction preflight (at most four workers, capped by available
+parallelism). Execution effects drain first. The actor captures all hosted-level
+revisions, executed/header tips, mining epochs/pool versions and template-relevant
+configuration CIDs; workers read a committed WAL snapshot and cannot mutate facts.
+Completion compares the entire basis before applying *any* policy refusals or
+issuing work. A child-only change reissues the original request, preserving
+coalesced waiters and their existing bounded retry counts. Exhaustion answers
+`ContextChanged`; stale errors do not become current `BuildFailed` responses.
+Runtime ingress caps all waiting template callers (including coalesced requests)
+at the configured limit and returns busy before inserting an excess waiter.
+The pure reducer retains the pinned Swift trace, whose coalescing branch does not
+apply that bound. Cancelled waiters release queue slots, and jobs with no remaining waiters are
+skipped before snapshot creation. A running blocking job keeps its snapshot and
+storage lease until it exits even when its requester disconnects.
+
+The actor still selects child contexts and reads their headers synchronously.
+The separate `/child-blocks/build` authoring route still assembles synchronously;
+this change does not claim a fully asynchronous runtime. Snapshot cache, WAL
+lifetime and cancellation limits are the same as the preflight pool described in
+`PORTING.md`. Unit tests exercise the actual single-thread host while a completed
+assembly worker is held: status and child-hosting requests proceed, a changed
+child basis discards the old result, and both waiting callers receive rebuilt
+work. Reducer tests cover retry exhaustion and late completion generations;
+additional actor tests check queued/running cancellation, coalesced ingress
+saturation, and a stale policy-refusal map naming a live transaction CID without
+removing it from the current pool before retry.

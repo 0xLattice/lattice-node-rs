@@ -75,6 +75,7 @@ pub enum MiningEvent {
     TipMoved(TipMove),
     TemplateRequested(u64, Box<TemplateRequest>),
     TemplateBuilt(Box<TemplateJob>, Option<Box<TemplateBuild>>),
+    TemplateContextChanged(Box<TemplateJob>),
     PolicyRefused {
         tip_cid: String,
         cids: Vec<String>,
@@ -278,6 +279,11 @@ impl MiningState {
     pub fn is_pending(&self, cid: &str) -> bool {
         self.admissions.contains_key(cid)
     }
+    /// Runtime ingress also applies this total bound to coalesced requests.
+    /// The pure reducer keeps the pinned Swift coalescing trace unchanged.
+    pub fn template_request_available(&self) -> bool {
+        self.waiting_template_requests() < self.config.max_waiting_template_requests
+    }
     pub fn waiting_template_requests(&self) -> usize {
         self.builds.values().map(|(_, r)| r.len()).sum()
     }
@@ -313,6 +319,13 @@ impl MiningState {
             ),
             MiningEvent::TemplateBuilt(job, build) => {
                 self.built(*job, build.map(|b| *b), now, &mut turn)
+            }
+            MiningEvent::TemplateContextChanged(job) => {
+                if job.tip_epoch == self.tip_epoch
+                    && let Some((job, waiting)) = self.builds.remove(&job.id)
+                {
+                    self.reissue_template(job, waiting, &mut turn);
+                }
             }
             MiningEvent::PolicyRefused { tip_cid, cids } => {
                 if tip_cid == self.tip_cid {
@@ -658,22 +671,28 @@ impl MiningState {
         }
         let stale = std::mem::take(&mut self.builds);
         for (_, (job, replies)) in stale {
-            let mut again = Vec::new();
-            for mut waiting in replies {
-                waiting.reissues += 1;
-                if waiting.reissues > self.config.max_reissues {
-                    turn.replies.push(MiningEffect::TemplateRefused(
-                        waiting.reply_id,
-                        TemplateError::ContextChanged,
-                    ))
-                } else {
-                    again.push(waiting)
-                }
-            }
-            if !again.is_empty() {
-                self.request_template(job.request, again, turn)
+            self.reissue_template(job, replies, turn);
+        }
+    }
+    fn reissue_template(&mut self, job: TemplateJob, replies: Vec<Waiting>, turn: &mut Turn) {
+        let mut again = Vec::new();
+        for mut waiting in replies {
+            waiting.reissues += 1;
+            if waiting.reissues > self.config.max_reissues {
+                turn.replies.push(MiningEffect::TemplateRefused(
+                    waiting.reply_id,
+                    TemplateError::ContextChanged,
+                ));
+            } else {
+                again.push(waiting);
             }
         }
+        if !again.is_empty() {
+            self.request_template(job.request, again, turn);
+        }
+    }
+    pub fn template_job_pending(&self, job: &TemplateJob) -> bool {
+        job.tip_epoch == self.tip_epoch && self.builds.contains_key(&job.id)
     }
     fn request_template(
         &mut self,
@@ -761,6 +780,15 @@ pub struct DurableMiningCore {
     storage: std::sync::Arc<crate::storage::NodeStorage>,
 }
 impl DurableMiningCore {
+    /// Only transient template waiters are cancelled; transactions keep their
+    /// admission semantics when an HTTP caller goes away.
+    pub(crate) fn cancel_template_requests(&mut self, ids: &BTreeSet<u64>) {
+        self.state.builds.retain(|_, (_, waiting)| {
+            waiting.retain(|entry| !ids.contains(&entry.reply_id));
+            !waiting.is_empty()
+        });
+    }
+
     pub fn new(state: MiningState, storage: std::sync::Arc<crate::storage::NodeStorage>) -> Self {
         Self { state, storage }
     }
@@ -802,7 +830,7 @@ pub struct RootPreflightTask {
     snapshot: lattice_volume_broker::DiskReadSnapshot,
     _storage: std::sync::Arc<crate::storage::NodeStorage>,
 }
-struct SnapshotSource<'a>(&'a lattice_volume_broker::DiskReadSnapshot);
+pub(crate) struct SnapshotSource<'a>(pub(crate) &'a lattice_volume_broker::DiskReadSnapshot);
 impl lattice_cashew::ContentSource for SnapshotSource<'_> {
     fn fetch(&self, cid: &str) -> Result<Vec<u8>, lattice_cashew::Error> {
         self.0

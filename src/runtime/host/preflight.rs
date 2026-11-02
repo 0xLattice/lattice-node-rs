@@ -1,11 +1,19 @@
-//! At most four blocking root/child preflights; actor retains all admission authority.
+//! Shared bounded mining CPU jobs; actor retains all admission authority.
 use super::*;
 pub(super) fn retain_epoch(queue: &mut VecDeque<Work>, epoch: u64) {
-    queue.retain(|work| !matches!(work, Work::Mining(effect) if matches!(effect.as_ref(), MiningEffect::Preflight(job) if job.tip_epoch != epoch)));
+    queue.retain(|work| match work {
+        Work::Mining(effect) => match effect.as_ref() {
+            MiningEffect::Preflight(job) => job.tip_epoch == epoch,
+            MiningEffect::BuildTemplate(job) => job.tip_epoch == epoch,
+            _ => true,
+        },
+        _ => true,
+    });
 }
 pub(super) enum Completion {
     Root(RootPreflightCompletion),
     Child(Vec<String>, ChildPreflightCompletion),
+    Template(Box<templates::TemplateCompletion>),
 }
 const MAX_WORKERS: usize = 4;
 pub(super) struct Preflights {
@@ -35,7 +43,10 @@ impl Preflights {
     pub(super) fn start_child(&mut self, path: Vec<String>, task: ChildPreflightTask) {
         self.spawn(move || task.run(now()).map(|done| Completion::Child(path, done)));
     }
-    fn spawn(
+    pub(super) fn start_template(&mut self, task: templates::TemplateTask) {
+        self.spawn(move || Ok(Completion::Template(Box::new(task.run()))));
+    }
+    pub(super) fn spawn(
         &mut self,
         run: impl FnOnce() -> Result<Completion, crate::storage::StoreError> + Send + 'static,
     ) {

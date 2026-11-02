@@ -321,8 +321,8 @@ impl Host {
         else {
             if route == "/status" {
                 let mut value = json!({"phase":"awaitingGenesis","chainPath":path,"nexusGenesisCID":self.genesis,"mempoolCount":0,"mempoolBytes":0});
-                if !tree.canonical_tip().is_empty() {
-                    value["bestHeaderHeight"] = json!(tree.highest_block_height().to_string());
+                if let Some(height) = tree.height(tree.canonical_tip()) {
+                    value["bestHeaderHeight"] = json!(height.to_string());
                 }
                 return Ok(Some(value));
             }
@@ -336,7 +336,7 @@ impl Host {
         match route {
             "/api/deposits" | "/api/deposit-state" => self.dictionary_read(route, q),
             "/status" => Ok(Some(
-                json!({"phase":"active","chainPath":path,"nexusGenesisCID":self.genesis,"tipCID":tip,"height":tree.height(tip).unwrap_or(0).to_string(),"bestHeaderHeight":tree.highest_block_height().to_string(),"mempoolCount":mining.map(|m|m.mempool().count()).unwrap_or(0),"mempoolBytes":mining.map(|m|m.mempool().byte_count()).unwrap_or(0)}),
+                json!({"phase":"active","chainPath":path,"nexusGenesisCID":self.genesis,"tipCID":tip,"height":tree.height(tip).unwrap_or(0).to_string(),"bestHeaderHeight":tree.height(tree.canonical_tip()).unwrap_or(0).to_string(),"mempoolCount":mining.map(|m|m.mempool().count()).unwrap_or(0),"mempoolBytes":mining.map(|m|m.mempool().byte_count()).unwrap_or(0)}),
             )),
             "/api/chain/info" => Ok(Some(
                 json!({"chain":path,"genesisHash":genesis,"height":tree.height(tip).unwrap_or(0).to_string(),"tipCID":tip,"minRelayFee":self.mining.state().mempool().limits().min_relay_fee.to_string(),"acceptsSubmit":mining.is_some()}),

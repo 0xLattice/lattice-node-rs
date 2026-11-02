@@ -142,3 +142,57 @@ fn actual_swift_mining_event_effect_trace() {
         );
     }
 }
+
+#[test]
+fn child_context_retries_preserve_coalesced_waiters_and_bound_reissues() {
+    let mut state = MiningState::new(
+        "same-root".into(),
+        None,
+        MiningConfig {
+            max_reissues: 2,
+            ..Default::default()
+        },
+    );
+    let take_job = |effects: Vec<MiningEffect>| {
+        effects
+            .into_iter()
+            .find_map(|e| match e {
+                MiningEffect::BuildTemplate(job) => Some(job),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let mut job = take_job(state.step(MiningEvent::TemplateRequested(41, Box::default()), 100));
+    assert!(
+        state
+            .step(MiningEvent::TemplateRequested(42, Box::default()), 101)
+            .is_empty()
+    );
+    for _ in 0..2 {
+        let old = job.clone();
+        job = take_job(state.step(MiningEvent::TemplateContextChanged(Box::new(job)), 102));
+        assert_ne!(old.id, job.id);
+        assert_eq!(old.tip_epoch, job.tip_epoch);
+        assert_eq!(state.waiting_template_requests(), 2);
+        // A late completion from the abandoned generation cannot consume the
+        // waiters now owned by its replacement.
+        assert!(
+            state
+                .step(MiningEvent::TemplateBuilt(Box::new(old), None), 103)
+                .is_empty()
+        );
+    }
+    let refused = state.step(MiningEvent::TemplateContextChanged(Box::new(job)), 104);
+    let ids: BTreeSet<_> = refused
+        .into_iter()
+        .filter_map(|e| match e {
+            MiningEffect::TemplateRefused(
+                id,
+                lattice_node::core::work::TemplateError::ContextChanged,
+            ) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, [41, 42].into());
+    assert_eq!(state.waiting_template_requests(), 0);
+}

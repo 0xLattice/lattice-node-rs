@@ -14,6 +14,7 @@ mod preflight;
 mod proofs;
 mod reads;
 mod retention;
+mod templates;
 mod validation;
 use super::network::{Network, NetworkEvent};
 use crate::{
@@ -58,7 +59,11 @@ pub struct RunningHost {
     pub public_key: String,
     pub task: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
+#[cfg(test)]
+type HostInspection = std::sync::Mutex<Box<dyn FnOnce(&mut Host) + Send>>;
 enum Command {
+    #[cfg(test)]
+    Inspect(HostInspection),
     Request(String, Value, oneshot::Sender<(u16, Value)>),
     Volume(String, oneshot::Sender<Option<Vec<u8>>>),
     Shutdown,
@@ -431,6 +436,7 @@ impl Host {
         let mut timer = tokio::time::interval(std::time::Duration::from_millis(250));
         loop {
             self.cancel_abandoned_fetches().await?;
+            self.cancel_abandoned_templates();
             self.drain().await?;
             self.publish_health();
             self.maintain_retention();
@@ -438,6 +444,7 @@ impl Host {
             tokio::select! {
              completion=self.preflights.next(), if self.preflights.active()=>{
                 match completion? {
+                    preflight::Completion::Template(done)=>self.complete_template(*done)?,
                     preflight::Completion::Root(done)=>{
                         let effects=self.mining.complete_root_preflight(done,now())?;
                         self.enqueue(effects);
@@ -451,7 +458,7 @@ impl Host {
                     }
                 }
              },
-             command=input.recv()=>match command {Some(Command::Request(route,body,reply))=>{self.api(route,body,reply)?},Some(Command::Volume(cid,reply))=>{let _=reply.send(self.storage.fetch_volume(&cid).and_then(operator::archive));},Some(Command::Shutdown)|None=>{let _=self.ledger.save();self.network.stop().await;return Ok(())}},
+             command=input.recv()=>match command {#[cfg(test)] Some(Command::Inspect(inspect))=>inspect.into_inner().unwrap()(&mut self),Some(Command::Request(route,body,reply))=>{self.api(route,body,reply)?},Some(Command::Volume(cid,reply))=>{let _=reply.send(self.storage.fetch_volume(&cid).and_then(operator::archive));},Some(Command::Shutdown)|None=>{let _=self.ledger.save();self.network.stop().await;return Ok(())}},
              event=self.network.next()=>match event?{Some(event)=>self.network_event(event).await?,None=>return Err(anyhow::anyhow!("Ivy stopped"))},
              _=timer.tick()=>{if self.last_ledger_save.elapsed()>=std::time::Duration::from_secs(30){let _=self.ledger.save();self.last_ledger_save=std::time::Instant::now();}self.network.tick().await?;self.tick_fact_turn()?;}
             }
@@ -592,17 +599,23 @@ impl Host {
                             }
                         }
                         Fetch::ChildIndex(path, peer, cid) => {
-                            if let Some(core) = self.levels.get_mut(&path) {
+                            if self.levels.get(&path).is_some() {
                                 let bytes = volumes
                                     .as_ref()
                                     .and_then(|vs| vs.iter().find_map(|v| v.entries.get(&cid)));
-                                let effects = core.child_index_fetched(
-                                    &peer,
-                                    &cid,
-                                    bytes.map(Vec::as_slice),
-                                    now(),
-                                )?;
-                                self.queue.push_back(Work::Child(path, effects));
+                                let storage = self.storage.clone();
+                                storage.atomic_fact_turn(|| -> anyhow::Result<()> {
+                                    let effects =
+                                        self.levels.get_mut(&path).unwrap().child_index_fetched(
+                                            &peer,
+                                            &cid,
+                                            bytes.map(Vec::as_slice),
+                                            now(),
+                                        )?;
+                                    self.queue.push_back(Work::Child(path, effects));
+                                    self.wake_children()?;
+                                    Ok(())
+                                })?;
                             }
                         }
                         Fetch::Body(cid) => {
@@ -692,9 +705,7 @@ impl Host {
      deferred_preflights.push_back(Work::Mining(Box::new(MiningEffect::Preflight(job))));
     },
     MiningEffect::BuildTemplate(job)=>{
-     let anchor=self.chain.tree().difficulty_anchor(&job.tip_cid).map(|a|lattice_validation::DifficultyAnchor{block_height:a.block_height,timestamp:a.timestamp,target:UInt256(a.target)});
-     let contexts=self.child_templates(&job.tip_cid)?;
-     match super::merged_template::build_merged_template(&job,self.storage.as_ref(),now(),anchor,&contexts){Ok(output)=>{self.child_policy_refused(&output.refused)?;self.event(MiningEvent::PolicyRefused{tip_cid:job.tip_cid.clone(),cids:output.refused.get(&vec!["Nexus".into()]).cloned().unwrap_or_default()})?;self.event(MiningEvent::TemplateBuilt(Box::new(job),Some(Box::new(output.build))))?;},Err(_)=>self.event(MiningEvent::TemplateBuilt(Box::new(job),None))?}
+     if self.mining.state().template_job_pending(&job){deferred_preflights.push_back(Work::Mining(Box::new(MiningEffect::BuildTemplate(job))));}
     },
     MiningEffect::TemplateIssued(id,t)=>self.reply(id,(200,json!({"workID":t.work_id,"block":t.block,"searchTarget":t.search_target,"targets":t.targets,"chainPath":["Nexus"],"expiresInMilliseconds":t.expires_at.saturating_sub(now()).max(0),"templateDigest":t.digest,"chains":t.chains.iter().map(|c|json!({"chainPath":c.chain_path,"target":c.target,"height":c.height.to_string(),"rewardRecipient":c.reward_recipient})).collect::<Vec<_>>()}))),
     MiningEffect::TemplateRefused(id,error)|MiningEffect::WorkRefused(id,error)=>self.reply(id,error_fn(error)),
@@ -764,17 +775,24 @@ impl Host {
                 break;
             };
             match work {
-                Work::Mining(effect) => {
-                    if let MiningEffect::Preflight(job) = *effect
-                        && let Some(task) = self
+                Work::Mining(effect) => match *effect {
+                    MiningEffect::Preflight(job) => {
+                        if let Some(task) = self
                             .mining
                             .prepare_root_preflight(&job, self.chain.tree())?
-                    {
-                        self.preflights.start(task);
+                        {
+                            self.preflights.start(task);
+                        }
                     }
-                }
+                    MiningEffect::BuildTemplate(job) => {
+                        if let Some(task) = self.prepare_template(job)? {
+                            self.preflights.start_template(task);
+                        }
+                    }
+                    _ => unreachable!("only mining CPU jobs are deferred"),
+                },
                 Work::ChildMining(path, effect) => self.child_mining_effect(path, *effect).await?,
-                _ => unreachable!("only preflight work is deferred"),
+                _ => unreachable!("only mining CPU jobs are deferred"),
             }
         }
         self.queue.extend(deferred_preflights);
@@ -910,10 +928,14 @@ impl Host {
                 .into_iter()
                 .map(|i| i.transaction)
                 .collect::<Vec<_>>();
-            let _=reply.send((200,json!({"phase":"active","chainPath":["Nexus"],"nexusGenesisCID":self.genesis,"tipCID":tip,"height":self.chain.tree().height(tip).unwrap_or(0).to_string(),"revision":self.chain.tree().current_revision().to_string(),"mempoolCount":self.mining.state().mempool().count(),"mempoolBytes":self.mining.state().mempool().byte_count(),"templateDigest":super::merged_template::merged_template_digest(tip,&txs,&self.child_templates(tip)?),"bestHeaderHeight":self.chain.tree().highest_block_height().to_string()})));
+            let _=reply.send((200,json!({"phase":"active","chainPath":["Nexus"],"nexusGenesisCID":self.genesis,"tipCID":tip,"height":self.chain.tree().height(tip).unwrap_or(0).to_string(),"revision":self.chain.tree().current_revision().to_string(),"mempoolCount":self.mining.state().mempool().count(),"mempoolBytes":self.mining.state().mempool().byte_count(),"templateDigest":super::merged_template::merged_template_digest(tip,&txs,&self.child_templates(tip)?),"bestHeaderHeight":self.chain.tree().height(self.chain.tree().canonical_tip()).unwrap_or(0).to_string()})));
             return Ok(());
         }
         if self.replies.len() >= 128 {
+            let _ = reply.send((503, json!({"error":{"message":"busy"}})));
+            return Ok(());
+        }
+        if route == "/mining/templates" && !self.mining.state().template_request_available() {
             let _ = reply.send((503, json!({"error":{"message":"busy"}})));
             return Ok(());
         }

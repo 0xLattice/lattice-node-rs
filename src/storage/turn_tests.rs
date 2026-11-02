@@ -470,6 +470,15 @@ fn joined_failure_cannot_be_swallowed_and_commit_provisional_facts() {
 
 #[test]
 fn one_verified_child_result_commits_unblocked_headers_proofs_and_cursor_together() {
+    child_event_atomic_fixture(false);
+}
+
+#[test]
+fn one_child_index_result_commits_unblocked_headers_proofs_and_cursor_together() {
+    child_event_atomic_fixture(true);
+}
+
+fn child_event_atomic_fixture(via_index: bool) {
     use crate::core::{
         levels::ChildChainCore,
         stream::{StreamConfig, SyncEffect},
@@ -550,7 +559,11 @@ fn one_verified_child_result_commits_unblocked_headers_proofs_and_cursor_togethe
         .unwrap();
         let entry = |child: &Block, carrier: &Block| HeaderEntry {
             block: child.clone(),
-            children: child.children.node.as_deref().cloned(),
+            children: if via_index {
+                None
+            } else {
+                child.children.node.as_deref().cloned()
+            },
             spec: child.spec.0.node.as_deref().cloned(),
             proofs: vec![
                 ChildBlockProof::generate(&content_id(carrier).unwrap(), "Alpha", storage.as_ref())
@@ -567,7 +580,18 @@ fn one_verified_child_result_commits_unblocked_headers_proofs_and_cursor_togethe
         assert!(!core.tree().contains(&cid1));
         core.queue_header(entry(&child0, &carrier0), Some(peer.clone()), None, 3000)
             .unwrap();
-        let completion = core.proof_work().checks.remove(0).run(None);
+        let mut completion = Some(core.proof_work().checks.remove(0).run(None));
+        if via_index {
+            storage
+                .fact_turn_or_join(|| core.proof_completed(completion.take().unwrap(), 3000))
+                .unwrap();
+            assert!(!core.tree().contains(&cid0));
+            assert!(!core.tree().contains(&cid1));
+            assert_eq!(
+                core.sync().peers[&peer].child_index.as_ref().unwrap().cid,
+                child0.children.raw_cid
+            );
+        }
         let trigger=match failure {
             "second_header"=>format!("CREATE TEMP TRIGGER fail_proof_turn BEFORE INSERT ON headers WHEN NEW.cid='{cid1}' BEGIN SELECT RAISE(ABORT,'second header'); END"),
             "second_proof"=>format!("CREATE TEMP TRIGGER fail_proof_turn BEFORE INSERT ON child_proofs WHEN NEW.child='{cid1}' BEGIN SELECT RAISE(ABORT,'second proof'); END"),
@@ -583,7 +607,14 @@ fn one_verified_child_result_commits_unblocked_headers_proofs_and_cursor_togethe
                 .execute_batch(&trigger)
                 .unwrap();
         }
-        let result = storage.fact_turn_or_join(|| core.proof_completed(completion, 3000));
+        let index = lattice_cashew::cbor::encode(child0.children.node.as_deref().unwrap()).unwrap();
+        let result = storage.fact_turn_or_join(|| {
+            if via_index {
+                core.child_index_fetched(&peer, &child0.children.raw_cid, Some(&index), 3000)
+            } else {
+                core.proof_completed(completion.take().unwrap(), 3000)
+            }
+        });
         assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
         let saved = storage.journal().recovery_snapshot(&path).unwrap();
         let committed = failure == "none";

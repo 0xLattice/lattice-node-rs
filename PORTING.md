@@ -432,9 +432,12 @@ validation; it also rejects an A-to-B-to-A child epoch completion. Root and chil
 jobs share one capacity limit; queued execution work drains before either kind
 starts, and stale child jobs are pruned before preparation. This ports the
 preflight worker boundary from pinned Swift `NodeRuntime.swift` and
-`NodeRuntime+API.swift`'s mining-job queue. Root transitions, template building,
-and proof batches remain separate scheduling work; full asynchronous executor
-parity is not claimed.
+`NodeRuntime+API.swift`'s mining-job queue. Merged `/mining/templates` assembly
+now shares this pool and fences every hosted-level basis before policy refusals
+or work issuance; see `docs/MERGED_TEMPLATES.md` for bounded retries, cancellation
+and actor tests. Root transitions, explicit child-author assembly and proof
+batches remain separate scheduling work; full asynchronous executor parity is
+not claimed.
 
 ### Explicit peer reconnect wiring
 

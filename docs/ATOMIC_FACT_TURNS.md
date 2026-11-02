@@ -6,6 +6,9 @@ journal transaction before processing their queued effects:
 - One timer tick across the root and every hosted child, including ready
   deferred headers, proofs/cursors, descendant run updates, and synchronous
   mining updates. Subsequent proof-worker completions remain separate events.
+- Each child-index fetch completion, including all authenticated headers it
+  unblocks, proofs/cursors, descendant run updates, and synchronous mining
+  updates. The fetched CAS content is retained before entering the journal turn.
 - A mined root header and the carried headers/proofs of all hosted descendants.
 - A root execution result, descendant wakes, and synchronous mining updates.
 - A child execution result, descendant wakes, local proof completions, and
@@ -73,3 +76,11 @@ window, then admits one root header and two hosted child successors on one tick.
 An injected later-child proof failure rolls back all three headers and the root
 stream cursor; restoration sees the previous facts. The success case restores
 all three. Header receipt remains on its existing admission implementation.
+
+The child-index regression authenticates a child genesis and successor while
+withholding their shared index. One actual index completion unlocks both;
+injected failures at the successor header, successor proof, or final stream
+cursor restore neither new header nor proof and preserve the earlier cursor.
+Successful completion restores both headers and proofs with the advanced cursor.
+The runtime queues resulting effects and attributes descendant runs inside the
+same turn; storage failure exits the host before those effects can be processed.

@@ -1,0 +1,16 @@
+{
+  "cases": 27,
+  "source_sha256": {
+    "Sources/LatticeNode/Mining/MiningTemplateAssembly.swift": "600487592d4bfa3121de4aafc9b2f474f708fd144410d2d024b435a84f5cca3d",
+    "Sources/LatticeNode/Mining/MiningPlan.swift": "80638a28b931fa564ee5b8edf9552ebfa4e58c603a5b6b903b4640d830255648",
+    "Sources/LatticeNode/Runtime/NodeRuntime+API.swift": "14ebb218360ca83ac392cd8021a1301fcbcc33a3192b8cb37203c236d66ed1f9",
+    "Sources/LatticeNodeCore/Mempool/Mempool.swift": "75b62b487410a5239afc0e4cf263a0e6641c3727e4e3eb7bca922a26d6f86dbe",
+    "Sources/LatticeNodeCore/Mining/MiningState.swift": "67b5ece57c7ac73d1cb7086b7674c7711affa47d0c61ad7c8deba4b3736341f8",
+    "Sources/LatticeNodeAPI/MiningWork.swift": "32dcc1ba56d4f9b881a0582eecddeccacbe898557f74cf344e2d68c4f50c22d3",
+    "Sources/LatticeNode/Networking/WireValidation.swift": "41c7d628ad03bc6602c69d19a3ef711e015bbd265be6ea5ae31b63c27e2a6a89"
+  },
+  "corpus_sha256": "db140299329a39bb013babbd8ac1972420c5057d36f73373d8bf4dadd23829b2",
+  "method": "Original full assembly (three unused imports removed); exact extracted policy, digest, CID, minimumWork and atom methods; actual pinned full Lattice libraries. Support-only NodeAPIError declaration. Clock clamped explicitly from supplied now.",
+  "node_revision": "3df9e0a786c7b103a3da88d1c3881efc81706255",
+  "lattice_revision": "dda2d852429a27be6043599b63bde81530cd9514"
+}

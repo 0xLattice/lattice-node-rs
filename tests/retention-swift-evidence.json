@@ -1,0 +1,18 @@
+{
+  "node_revision": "3df9e0a786c7b103a3da88d1c3881efc81706255",
+  "lattice_revision": "dda2d852429a27be6043599b63bde81530cd9514",
+  "cases": 19,
+  "source_sha256": {
+    "Sources/LatticeNode/Runtime/NodeStorage+Retention.swift": "82e015f3053b97369e5a48828e2037112b9a1cd00f04ac13ec1c7ae0ec800241",
+    "Sources/LatticeNode/Runtime/NodeStorage+RuntimeEffects.swift": "3417ed7f22c27ea1c8ba9c1fe76fe0e22d3160dc126e039d9d9702056ca4866e"
+  },
+  "dependency_lock_sha256": "958f69bd3ec734a372e8cd94e3d09d593674a1025979a2abe2b45a6f08cfc9a6",
+  "harness_sha256": {
+    "tools/retention-swift-vectors.py": "c136d4738e84b1c53bdd271e1386a37a1151114256904c4d5681f0e81c014341",
+    "examples/retention-swift-samples.rs": "352cfe408e3e3c36a7dcda8cd4021f305f61d29e8819f7c4dfbc6a350d9007d4",
+    "tests/retention-swift-support/mod.rs": "5e1e463a05b508c4407dc3659191fba86fd5dcce5a13c94c9da005146c87a7a7",
+    "tests/retention-swift-oracle.swift": "577427aa183e62119f21cc6b62ece5f11fea5b9a18d0400051ac03e3f8a73476"
+  },
+  "corpus_sha256": "994a2d153201fa6068df7b8700caca42d830f9852348c8eccdcb19ca0593fc6e",
+  "method": "Exact private TipStateWalk actor and NodeStorage.children/loadedNode methods from pinned node, unchanged pinned Lattice/cashew. NodeStorage adapter supplies an in-memory CountStore.stateCount and InMemoryContentSource only. Inputs use raw unresolved root headers. Compares complete signed changes dictionary including zero deltas and sorted entering CIDs. No broker pins, transactions or physical eviction exercised."
+}

@@ -1,0 +1,362 @@
+{
+  "source_sha256": "188298e008716e5849408a4f956fae81cf6b31071edd30f87dc57f701d5b2228",
+  "function_sha256": "f193b329dd9b22204e13fcd1cdf6f0e0c82d40eab296d77f0e3eb023b47665a2",
+  "rows": [
+    {
+      "url": "https://reads.example",
+      "valid": true
+    },
+    {
+      "url": "http://127.0.0.1:8080/base",
+      "valid": true
+    },
+    {
+      "url": "HTTP://example.com",
+      "valid": true
+    },
+    {
+      "url": "https://[::1]:80",
+      "valid": true
+    },
+    {
+      "url": "http://user@example.com",
+      "valid": false
+    },
+    {
+      "url": "http://:password@example.com",
+      "valid": false
+    },
+    {
+      "url": "http://example.com?",
+      "valid": false
+    },
+    {
+      "url": "http://example.com#",
+      "valid": false
+    },
+    {
+      "url": "http://",
+      "valid": false
+    },
+    {
+      "url": "ftp://example.com",
+      "valid": false
+    },
+    {
+      "url": "/relative",
+      "valid": false
+    },
+    {
+      "url": "https://\u4f8b\u5b50.test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/space here",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/%zz",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/%00",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/\\x",
+      "valid": true
+    },
+    {
+      "url": "https://a:abc",
+      "valid": false
+    },
+    {
+      "url": "https://a:99999",
+      "valid": true
+    },
+    {
+      "url": "https://a:",
+      "valid": true
+    },
+    {
+      "url": "https://[xyz]",
+      "valid": true
+    },
+    {
+      "url": "https://[fe80::1%25en0]",
+      "valid": true
+    },
+    {
+      "url": "https://atest",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/a",
+      "valid": true
+    },
+    {
+      "url": "https://_test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/_",
+      "valid": true
+    },
+    {
+      "url": "https://-test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/-",
+      "valid": true
+    },
+    {
+      "url": "https://.test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/.",
+      "valid": true
+    },
+    {
+      "url": "https://~test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/~",
+      "valid": true
+    },
+    {
+      "url": "https://!test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/!",
+      "valid": true
+    },
+    {
+      "url": "https://$test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/$",
+      "valid": true
+    },
+    {
+      "url": "https://&test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/&",
+      "valid": true
+    },
+    {
+      "url": "https://'test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/'",
+      "valid": true
+    },
+    {
+      "url": "https://(test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/(",
+      "valid": true
+    },
+    {
+      "url": "https://)test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/)",
+      "valid": true
+    },
+    {
+      "url": "https://*test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/*",
+      "valid": true
+    },
+    {
+      "url": "https://+test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/+",
+      "valid": true
+    },
+    {
+      "url": "https://,test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/,",
+      "valid": true
+    },
+    {
+      "url": "https://;test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/;",
+      "valid": true
+    },
+    {
+      "url": "https://:test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/:",
+      "valid": true
+    },
+    {
+      "url": "https://=test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/=",
+      "valid": true
+    },
+    {
+      "url": "https://%test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/%",
+      "valid": true
+    },
+    {
+      "url": "https://%20test",
+      "valid": true
+    },
+    {
+      "url": "https://example.com/%20",
+      "valid": true
+    },
+    {
+      "url": "https://%zztest",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/%zz",
+      "valid": true
+    },
+    {
+      "url": "https://[test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/[",
+      "valid": true
+    },
+    {
+      "url": "https://]test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/]",
+      "valid": true
+    },
+    {
+      "url": "https://\\test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/\\",
+      "valid": true
+    },
+    {
+      "url": "https://|test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/|",
+      "valid": true
+    },
+    {
+      "url": "https://^test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/^",
+      "valid": true
+    },
+    {
+      "url": "https://`test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/`",
+      "valid": true
+    },
+    {
+      "url": "https://{test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/{",
+      "valid": true
+    },
+    {
+      "url": "https://}test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/}",
+      "valid": true
+    },
+    {
+      "url": "https://<test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/<",
+      "valid": true
+    },
+    {
+      "url": "https://>test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/>",
+      "valid": true
+    },
+    {
+      "url": "https://\"test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/\"",
+      "valid": true
+    },
+    {
+      "url": "https://@test",
+      "valid": false
+    },
+    {
+      "url": "https://example.com/@",
+      "valid": true
+    },
+    {
+      "url": "https://x/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": true
+    },
+    {
+      "url": "https://x/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": true
+    },
+    {
+      "url": "https://x/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false
+    },
+    {
+      "url": "https://x/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false
+    }
+  ]
+}

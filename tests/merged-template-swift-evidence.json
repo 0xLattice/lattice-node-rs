@@ -1,0 +1,23 @@
+{
+  "node_revision": "3df9e0a786c7b103a3da88d1c3881efc81706255",
+  "lattice_revision": "dda2d852429a27be6043599b63bde81530cd9514",
+  "dependency_lock_sha256": "958f69bd3ec734a372e8cd94e3d09d593674a1025979a2abe2b45a6f08cfc9a6",
+  "harness_sha256": {
+    "tools/merged-template-swift-vectors.py": "59e15f8ef54b20f891bf777b5250b870e2ae2182e00a16d5c95f39dadcc99ebe",
+    "examples/merged-template-swift-samples.rs": "3c5c2fdf8359df32af890d36d6d6f555ba667a4fec78855ff83ff6a015b89bcb",
+    "tests/merged-template-swift-support/mod.rs": "8f43ff01e9e5f94fb9836bfc388cc5fda636ce04c06f5c42a753ed21a5dcf6f5"
+  },
+  "cases": 24,
+  "source_sha256": {
+    "Sources/LatticeNode/Mining/MiningTemplateAssembly.swift": "600487592d4bfa3121de4aafc9b2f474f708fd144410d2d024b435a84f5cca3d",
+    "Sources/LatticeNode/Mining/MiningPlan.swift": "80638a28b931fa564ee5b8edf9552ebfa4e58c603a5b6b903b4640d830255648",
+    "Sources/LatticeNode/Runtime/NodeRuntime+API.swift": "14ebb218360ca83ac392cd8021a1301fcbcc33a3192b8cb37203c236d66ed1f9",
+    "Sources/LatticeNodeCore/Mempool/Mempool.swift": "75b62b487410a5239afc0e4cf263a0e6641c3727e4e3eb7bca922a26d6f86dbe",
+    "Sources/LatticeNodeCore/Mining/MiningState.swift": "67b5ece57c7ac73d1cb7086b7674c7711affa47d0c61ad7c8deba4b3736341f8",
+    "Sources/LatticeNodeAPI/MiningWork.swift": "32dcc1ba56d4f9b881a0582eecddeccacbe898557f74cf344e2d68c4f50c22d3",
+    "Sources/LatticeNode/Networking/WireValidation.swift": "41c7d628ad03bc6602c69d19a3ef711e015bbd265be6ea5ae31b63c27e2a6a89"
+  },
+  "corpus_sha256": "d1e2091561a0e5185b2878069ce4cf28262522f77e124cb677b3990e56117ef8",
+  "oracle_sha256": "449924100b1d243e9e65dc14c2e78d575e8c12d282f572ff8fae2322f4d21839",
+  "method": "Original full assembly (three unused imports removed); exact extracted policy, digest, CID, minimumWork and atom methods; actual pinned full Lattice libraries. Support-only NodeAPIError declaration. Local direct child candidates have no scheduling witness. Timestamp is previous.timestamp+1; the supplied anchor is the previous header. Observations compare exact block CIDs, selected transaction CIDs, carried child directories and threshold vectors. This verifies assembly and scheduling, not admission or securing proofs."
+}

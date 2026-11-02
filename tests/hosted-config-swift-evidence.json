@@ -1,0 +1,15 @@
+{
+  "node_revision": "3df9e0a786c7b103a3da88d1c3881efc81706255",
+  "lattice_revision": "dda2d852429a27be6043599b63bde81530cd9514",
+  "cases": 29,
+  "source_sha256": "14ebb218360ca83ac392cd8021a1301fcbcc33a3192b8cb37203c236d66ed1f9",
+  "dependency_lock_sha256": "958f69bd3ec734a372e8cd94e3d09d593674a1025979a2abe2b45a6f08cfc9a6",
+  "harness_sha256": {
+    "tools/hosted-config-swift-vectors.py": "1d6a234219e5357e418c67c3ff8fe30993260433dd97a85f7e8c46d3ebbf5426",
+    "examples/hosted-config-swift-samples.rs": "97807039ffa12c7732b4f5852c6a4ae41ff600d9f749af5cc45deeebc7385e37",
+    "tests/hosted-config-swift-support/mod.rs": "5096dc79cb8a835ae63bbe4a946714b78f34194f72a96a63da72420d6b8505a0",
+    "tests/hosted-config-swift-oracle.swift": "78c42c432dbb560cf682551058e1f5c3ac7cbd7ceedde1932145ca6d292aef77"
+  },
+  "corpus_sha256": "1e50e2bad4e04277d3a6b8b5cea39f6832acdf9d6958c04b4aa8c6ae93ce09d1",
+  "method": "Exact extracted premine, checkPremine and PremineError methods, unchanged pinned full Lattice libraries. Only ChainPath typealias supplied. Policies in this corpus do not depend on timestamp: Swift reads Date and Rust receives timestamp 1. Compares accept/refuse and exact premine transaction CIDs, not error prose."
+}

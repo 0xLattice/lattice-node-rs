@@ -465,3 +465,22 @@ files. The actual daemon test verifies readable keys and a FIFO fail promptly
 before node storage is created, and a normal restart retains the public identity.
 Unix permission checks do not implement Windows ACL validation; Windows has the
 regular-file/size checks but no claimed private-ACL or no-follow enforcement.
+
+## Windows serving-ledger publication
+
+Operator credit still persists before mutating the shared Tally. The temporary
+file is flushed and closed first; Windows publishes it with MoveFileExW using
+REPLACE_EXISTING and WRITE_THROUGH on same-directory verbatim paths. Other
+platforms retain rename followed by directory sync. This avoids the unsupported
+Unix-style directory open/sync that caused Windows credit requests to return
+notSaved. The exact Windows helper cross-compiles for x86_64-pc-windows-msvc;
+actual Windows behavior is gated by the existing credit/reopen/failure tests
+and runtime-host restart test in CI, not inferred from the cross-check.
+
+The authenticated child-index [formal recovery bridge](docs/FORMAL_INDEX_RECOVERY.md)
+exports real verified pending-header/index completion and cold-reopen observations
+through unchanged pinned `Recovery.tla` operators. Its per-level model comparisons
+are distinct from the production event-footprint/SQLite assertions; it does not
+prove the multilevel Host schedule or full NodeCore. Run
+`python3.12 tools/formal-index-recovery-check.py` for the observations and negative
+controls, with machine-independent reports under `target/`.

@@ -1,4 +1,5 @@
 //! Real authenticated header imports exercise the production turn boundary.
+mod formal_index;
 use super::*;
 use lattice_block_tree::{ChainTree, ChildBlockProof};
 use lattice_cashew::{Header, MerkleDictionary, Volume};
@@ -479,6 +480,7 @@ fn one_child_index_result_commits_unblocked_headers_proofs_and_cursor_together()
 }
 
 fn child_event_atomic_fixture(via_index: bool) {
+    let mut formal_rows = vec![];
     use crate::core::{
         levels::ChildChainCore,
         stream::{StreamConfig, SyncEffect},
@@ -486,7 +488,7 @@ fn child_event_atomic_fixture(via_index: bool) {
     };
     for failure in ["none", "second_header", "second_proof", "cursor"] {
         let directory = tempfile::tempdir().unwrap();
-        let (storage, parent, _, _, carrier0, child0) = fixture(directory.path());
+        let (storage, parent, _, genesis, carrier0, child0) = fixture(directory.path());
         let mut child1 = child0.clone();
         child1.parent = Some(Volume::new(child0.clone()).unwrap());
         child1.height = 1;
@@ -592,6 +594,12 @@ fn child_event_atomic_fixture(via_index: bool) {
                 child0.children.raw_cid
             );
         }
+        let root_path = vec!["Nexus".to_owned()];
+        let root_cids = vec![content_id(&genesis).unwrap()];
+        let child_cids = vec![cid0.clone(), cid1.clone()];
+        let before_root = formal_index::observe(storage.as_ref(), &parent, &root_path, &root_cids);
+        let before_child = formal_index::observe(storage.as_ref(), core.tree(), &path, &child_cids);
+        let before_group = formal_index::grouped(storage.as_ref(), &path, &child_cids);
         let trigger=match failure {
             "second_header"=>format!("CREATE TEMP TRIGGER fail_proof_turn BEFORE INSERT ON headers WHEN NEW.cid='{cid1}' BEGIN SELECT RAISE(ABORT,'second header'); END"),
             "second_proof"=>format!("CREATE TEMP TRIGGER fail_proof_turn BEFORE INSERT ON child_proofs WHEN NEW.child='{cid1}' BEGIN SELECT RAISE(ABORT,'second proof'); END"),
@@ -631,8 +639,25 @@ fn child_event_atomic_fixture(via_index: bool) {
         for cid in [&cid0, &cid1] {
             assert_eq!(storage.journal().header(cid).unwrap().is_some(), committed);
         }
+        let after_group = formal_index::grouped(storage.as_ref(), &path, &child_cids);
+        let live_child = committed
+            .then(|| formal_index::observe(storage.as_ref(), core.tree(), &path, &child_cids));
         // Failed provisional cores are dropped, never reused after the error.
         drop(core);
+        drop(storage);
+        // Close all SQLite handles and reacquire the production directory lock.
+        let storage = Arc::new(
+            NodeStorage::open(directory.path(), content_id(&genesis).unwrap(), "atomic").unwrap(),
+        );
+        let (mut parent, _) = storage
+            .journal()
+            .restore_chain(
+                ChainRuntimeContext::new(root_path.clone(), Some(&root_cids[0])).unwrap(),
+                None,
+                vec![genesis.spec.0.node.as_deref().unwrap().clone()],
+            )
+            .unwrap();
+        parent.serve_runs("Alpha");
         let restored = ChildChainCore::open(
             storage.clone(),
             ChainRuntimeContext::new(path.clone(), None).unwrap(),
@@ -645,6 +670,28 @@ fn child_event_atomic_fixture(via_index: bool) {
         .unwrap();
         assert_eq!(restored.tree().contains(&cid0), committed);
         assert_eq!(restored.tree().contains(&cid1), committed);
+        let after_root = formal_index::observe(storage.as_ref(), &parent, &root_path, &root_cids);
+        let recovered_child =
+            formal_index::observe(storage.as_ref(), restored.tree(), &path, &child_cids);
+        let recovered_group = formal_index::grouped(storage.as_ref(), &path, &child_cids);
+        assert_eq!(
+            before_root, after_root,
+            "index completion must not change the parent"
+        );
+        assert_eq!(
+            after_group, recovered_group,
+            "reopen must preserve complete event footprint"
+        );
+        if !committed {
+            assert_eq!(before_group, after_group);
+        }
+        formal_rows.push(serde_json::json!({"failure":failure,"committed":committed,
+            "beforeRoot":before_root,"beforeChild":before_child,"liveChild":live_child,
+            "recoveredRoot":after_root,"recoveredChild":recovered_child,
+            "beforeGroup":before_group,"afterGroup":after_group,"recoveredGroup":recovered_group}));
+    }
+    if via_index && let Some(path) = std::env::var_os("LATTICE_FORMAL_INDEX_TRACE") {
+        std::fs::write(path,serde_json::to_vec_pretty(&serde_json::json!({"version":1,"event":"authenticated-child-index","rows":formal_rows})).unwrap()).unwrap();
     }
 }
 

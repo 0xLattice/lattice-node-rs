@@ -1,10 +1,11 @@
 //! ServingLedger.swift persistence boundary: operator credit is synced before
 //! it changes the shared Tally, while ordinary serving deltas save periodically.
+mod replace;
 use lattice_tally::{PeerId, Tally};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
 };
@@ -106,8 +107,8 @@ impl ServingLedger {
             let result = (|| {
                 file.write_all(&data)?;
                 file.sync_all()?;
-                std::fs::rename(&temp, &self.path)?;
-                File::open(self.path.parent().unwrap())?.sync_all()
+                drop(file);
+                replace::replace(&temp, &self.path)
             })();
             if result.is_err() {
                 let _ = std::fs::remove_file(temp);

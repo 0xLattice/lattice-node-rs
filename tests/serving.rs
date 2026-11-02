@@ -1,7 +1,10 @@
 use lattice_node::runtime::serving::*;
 #[test]
 fn credit_is_written_before_visibility_and_serving_deltas_survive_save() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("ledger-λ-信用-")
+        .tempdir()
+        .unwrap();
     let key = hex::encode(
         ed25519_dalek::SigningKey::from_bytes(&[9; 32])
             .verifying_key()

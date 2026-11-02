@@ -75,9 +75,9 @@ fn reached_endpoints_survive_atomic_restart_with_chain_books_and_exclusions() {
     );
     assert_eq!(memory.remembered(&root()), vec![endpoint(1)]);
     assert_eq!(memory.remembered(&child), vec![endpoint(1)]);
-    let file = directory.path().join("peers.json");
     #[cfg(unix)]
     {
+        let file = directory.path().join("peers.json");
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,

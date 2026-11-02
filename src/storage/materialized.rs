@@ -12,6 +12,7 @@ pub struct NodeStorage {
     retention: RetentionPolicy,
     pub(super) turn: turn::TurnGate,
     pub(super) turn_releases: Mutex<Option<Vec<(String, Roots)>>>,
+    pub(super) turn_failed: std::sync::atomic::AtomicBool,
     _directory_lock: StorageDirectoryLock,
 }
 impl NodeStorage {
@@ -53,6 +54,7 @@ impl NodeStorage {
             scope,
             turn: turn::TurnGate::new(),
             turn_releases: Mutex::new(None),
+            turn_failed: std::sync::atomic::AtomicBool::new(false),
             _directory_lock: lock,
         })
     }

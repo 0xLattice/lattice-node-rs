@@ -1,6 +1,6 @@
 //! Root node process entry point. Configuration paths are relative to the JSON file.
 use anyhow::{Context, bail};
-use ed25519_dalek::SigningKey;
+mod identity;
 use ivy_core::PeerEndpoint;
 use lattice_cashew::SerializedVolume;
 use lattice_node::runtime::{
@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::{
     collections::BTreeSet,
-    io::{Read, Write},
+    io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -120,45 +120,6 @@ fn read_bounded(path: &Path, limit: usize) -> anyhow::Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-fn identity(path: &Path) -> anyhow::Result<SigningKey> {
-    if !path.exists() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let key = SigningKey::generate(&mut rand_core::OsRng);
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        // create_new prevents concurrent starts from replacing an identity.
-        let mut file = options.open(path)?;
-        file.write_all(hex::encode(key.to_bytes()).as_bytes())?;
-        file.sync_all()?;
-        return Ok(key);
-    }
-    let bytes = read_bounded(path, 16 * 1024)?;
-    let text = std::str::from_utf8(&bytes)
-        .context("identity file is not UTF-8")?
-        .trim();
-    let hex_key = if text.starts_with('{') {
-        let object: Value = serde_json::from_str(text).context("invalid identity JSON")?;
-        object
-            .get("privateKey")
-            .and_then(Value::as_str)
-            .context("identity JSON requires privateKey")?
-            .to_owned()
-    } else {
-        text.to_owned()
-    };
-    let key: [u8; 32] = hex::decode(hex_key)
-        .map_err(|_| anyhow::anyhow!("identity must contain 32-byte private-key hex"))?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("identity must contain 32-byte private-key hex"))?;
-    Ok(SigningKey::from_bytes(&key))
-}
 struct Backend(HostHandle);
 impl RpcBackend for Backend {
     fn health(&self, route: String) -> RpcFuture {
@@ -224,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
     }
     lattice_cashew::canonical_cid(&config.genesis_cid).context("invalid genesis CID")?;
     let directory = resolve(base, &config.directory);
-    let key = identity(&resolve(base, &config.identity_key))?;
+    let key = identity::load_or_create(&resolve(base, &config.identity_key))?;
     let mut volumes: Vec<SerializedVolume> = Vec::new();
     for file in config.bootstrap_files {
         let mut batch: Vec<SerializedVolume> =

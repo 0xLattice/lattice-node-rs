@@ -761,7 +761,7 @@ impl Host {
             }
             Ok(None) => {}
         }
-        if let Some(response) = self.child_author(&route, &body) {
+        if let Some(response) = self.child_author(&route, &body)? {
             let _ = reply.send(response);
             return Ok(());
         }

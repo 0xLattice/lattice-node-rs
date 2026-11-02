@@ -909,6 +909,7 @@ dependencies = [
  "lattice-validation",
  "lattice-volume-broker",
  "lattice-wasm",
+ "libc",
  "num-bigint",
  "rand_core",
  "rusqlite",

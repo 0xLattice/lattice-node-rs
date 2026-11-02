@@ -31,7 +31,11 @@ fn decode<T: DeserializeOwned + Serialize>(value: &str) -> anyhow::Result<T> {
     Ok(node)
 }
 impl Host {
-    pub(super) fn child_author(&mut self, route: &str, body: &Value) -> Option<(u16, Value)> {
+    pub(super) fn child_author(
+        &mut self,
+        route: &str,
+        body: &Value,
+    ) -> anyhow::Result<Option<(u16, Value)>> {
         let result = if route == "/child-blocks/build" {
             Some(self.build_child(body))
         } else if route == "/child-blocks" {
@@ -52,10 +56,7 @@ impl Host {
         } else {
             None
         };
-        result.map(|r| match r {
-            Ok(value) => (200, value),
-            Err(e) => error(e),
-        })
+        author_response(result)
     }
     fn commitment_value(&self, path: &[String], state: &str) -> anyhow::Result<Option<String>> {
         let state =
@@ -260,5 +261,43 @@ impl Host {
         self.child_proofs(&path)?;
         let status = self.levels.get(&path).unwrap().header_status(&cid);
         Ok(json!({"blockCID":cid,"status":status}))
+    }
+}
+
+fn author_response(result: Option<anyhow::Result<Value>>) -> anyhow::Result<Option<(u16, Value)>> {
+    match result {
+        None => Ok(None),
+        Some(Ok(value)) => Ok(Some((200, value))),
+        // A failed durable barrier can leave provisional in-memory cores.
+        // Never turn it into an ordinary input refusal and keep the host alive.
+        Some(Err(e))
+            if e.downcast_ref::<crate::storage::StoreError>().is_some()
+                || e.downcast_ref::<children::FailedProofTurn>().is_some() =>
+        {
+            Err(e)
+        }
+        Some(Err(e)) => Ok(Some(error(e))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn failed_turns_are_fatal_even_when_the_cause_is_not_a_store_error() {
+        let malformed = author_response(Some(Err(anyhow::anyhow!("malformedBlock"))))
+            .unwrap()
+            .unwrap();
+        assert_eq!(malformed.0, 400);
+        assert!(
+            author_response(Some(Err(crate::storage::StoreError::Corrupt(
+                "journal".into()
+            )
+            .into())))
+            .is_err()
+        );
+        let unavailable = anyhow::anyhow!("state content missing after provisional admission")
+            .context(children::FailedProofTurn);
+        assert!(author_response(Some(Err(unavailable))).is_err());
     }
 }

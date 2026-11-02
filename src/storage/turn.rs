@@ -129,6 +129,26 @@ struct FactTurn<'a> {
     _synchronous: PhantomData<Rc<()>>,
 }
 impl NodeStorage {
+    /// One synchronous reducer event, or a constituent of the owner's mined /
+    /// connected event. A failed constituent poisons the enclosing barrier even
+    /// if an internal caller mistakenly catches its error.
+    pub(crate) fn fact_turn_or_join<T, E: From<StoreError>>(
+        &self,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let _serial = self.turn.lock().unwrap();
+        let _journal = self.store.db.gate.lock().unwrap();
+        let joined = self.turn_releases.lock().unwrap().is_some();
+        if !joined {
+            return self.atomic_fact_turn(action);
+        }
+        let result = action();
+        if result.is_err() {
+            self.turn_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
     /// Internal actor boundary only. All effects/replies must remain queued
     /// until this returns success. The closure must not await or publish state.
     pub(crate) fn atomic_fact_turn<T, E: From<StoreError>>(
@@ -148,6 +168,8 @@ impl NodeStorage {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(StoreError::from)?;
         *releases = Some(vec![]);
+        self.turn_failed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         drop(releases);
         let mut turn = FactTurn {
             storage: self,
@@ -155,6 +177,9 @@ impl NodeStorage {
             _synchronous: PhantomData,
         };
         let value = action()?;
+        if self.turn_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(StoreError::Corrupt("constituent fact turn failed".into()).into());
+        }
         self.store
             .db
             .lock()

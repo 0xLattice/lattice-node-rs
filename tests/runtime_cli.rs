@@ -144,3 +144,50 @@ fn actual_process_rpc_mine_shutdown_and_durable_restart() {
     stop(&mut process);
     assert!(!cookie_path.exists());
 }
+
+#[test]
+fn startup_refuses_public_identity_and_fifo_without_creating_node_storage() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("identity.key");
+    let config = dir.path().join("node.json");
+    std::fs::write(&config, json!({"directory":"data","identityKey":"identity.key","genesisCid":"bafyreiggtg4ezifboyekbf4gxst2jr3mpjqcxsbmopy7w6fp46g4ngpgxa","listen":"127.0.0.1:0","rpc":"127.0.0.1:0"}).to_string()).unwrap();
+    std::fs::write(&key, "11".repeat(32)).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    for expected in ["permissions", "regular file"] {
+        if expected == "regular file" {
+            std::fs::remove_file(&key).unwrap();
+            assert!(Command::new("mkfifo").arg(&key).status().unwrap().success());
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut child = Process(
+            Command::new(env!("CARGO_BIN_EXE_lattice-node"))
+                .arg("--config")
+                .arg(&config)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "identity check blocked startup");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!status.success());
+        let mut error = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut error)
+            .unwrap();
+        assert!(error.contains(expected), "{error}");
+        assert!(!dir.path().join("data").exists());
+    }
+}

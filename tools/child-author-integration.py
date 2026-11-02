@@ -11,6 +11,7 @@ import json
 import pathlib
 import runpy
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -121,6 +122,29 @@ def main():
                     code, value = author.rpc('/child-blocks', built['submit'])
                     assert code == 200, (code, value)
                     return value if value['status'] == 'tree' else None
+
+                if height == 0:
+                    # A real securing commitment is present, but the authored
+                    # child has not crossed its durable admission barrier.
+                    database = tmp / 'author/state.db'
+                    with sqlite3.connect(database) as db:
+                        baseline = db.execute("SELECT COUNT(*) FROM admission_batches WHERE chain_path='Nexus/Alpha'").fetchone()[0]
+                        assert baseline == 0
+                        db.execute("CREATE TRIGGER author_fact_failure BEFORE INSERT ON child_proofs WHEN NEW.chain='Nexus/Alpha' BEGIN SELECT RAISE(ABORT,'injected author proof failure'); END")
+                    code, failure = author.rpc('/child-blocks', built['submit'])
+                    assert code == 503, (code, failure)
+                    assert author.process.wait(timeout=15) != 0
+                    author.log.close()
+                    processes.remove(author)
+                    with sqlite3.connect(database) as db:
+                        assert db.execute("SELECT COUNT(*) FROM admission_batches WHERE chain_path='Nexus/Alpha'").fetchone()[0] == baseline
+                        assert db.execute("SELECT COUNT(*) FROM child_proofs WHERE chain='Nexus/Alpha'").fetchone()[0] == 0
+                        db.execute('DROP TRIGGER author_fact_failure')
+                    author.start()
+                    author.host(specpath, owner)
+                    assert author.state(True)['phase'] == 'awaitingGenesis'
+                    assert author.state()['tipCID'] == carrier['tipCID']
+                    report['author_storage_failure'] = {'status': code, 'fail_stopped': True, 'rolled_back_child': True, 'root_commitment_recovered': True}
 
                 accepted = wait_for(push)
                 state = wait_for(lambda: (s if (s := author.state(True)).get('tipCID') == built['blockCID'] else None))

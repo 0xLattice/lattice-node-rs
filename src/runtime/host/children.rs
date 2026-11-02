@@ -1,5 +1,8 @@
 //! Hosted levels share the actor's durable storage and authenticated sessions.
 use super::*;
+#[derive(Debug, thiserror::Error)]
+#[error("child proof turn failed")]
+pub(super) struct FailedProofTurn;
 impl Host {
     pub(super) fn child_parent(
         &self,
@@ -98,12 +101,19 @@ impl Host {
                 job.run(stored.as_ref(), &upstream, self.storage.as_ref())
             });
             for completion in completions {
-                let effects = self
-                    .levels
-                    .get_mut(path)
-                    .unwrap()
-                    .derivation_completed(completion, now())?;
-                self.queue.push_back(Work::Child(path.to_vec(), effects));
+                let storage = self.storage.clone();
+                storage
+                    .fact_turn_or_join(|| -> anyhow::Result<()> {
+                        let effects = self
+                            .levels
+                            .get_mut(path)
+                            .unwrap()
+                            .derivation_completed(completion, now())?;
+                        self.queue.push_back(Work::Child(path.to_vec(), effects));
+                        self.wake_children()?;
+                        Ok(())
+                    })
+                    .map_err(|error| error.context(FailedProofTurn))?;
             }
             if !work.lookup.is_empty() {
                 let found = self.storage.journal().saved_proofs(path, &work.lookup)?;
@@ -132,12 +142,19 @@ impl Host {
                 .iter()
                 .any(|result| result.missing_block().is_some());
             for completion in completions {
-                let effects = self
-                    .levels
-                    .get_mut(path)
-                    .unwrap()
-                    .proof_completed(completion, now())?;
-                self.queue.push_back(Work::Child(path.to_vec(), effects));
+                let storage = self.storage.clone();
+                storage
+                    .fact_turn_or_join(|| -> anyhow::Result<()> {
+                        let effects = self
+                            .levels
+                            .get_mut(path)
+                            .unwrap()
+                            .proof_completed(completion, now())?;
+                        self.queue.push_back(Work::Child(path.to_vec(), effects));
+                        self.wake_children()?;
+                        Ok(())
+                    })
+                    .map_err(|error| error.context(FailedProofTurn))?;
             }
             // A missing held block asks the index again on a later actor turn.
             // Immediately draining that retry would spin on unavailable content.

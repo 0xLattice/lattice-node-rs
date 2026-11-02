@@ -435,3 +435,21 @@ therefore handles initial refusals and peer process restarts. Named/fixed seed
 policy is unchanged. A two-host test keeps the author alive throughout initial
 parent absence and a later parent restart, verifying synchronization to the new
 block at the original address with default discovery timing.
+
+### Startup process identity checks
+
+Pinned Swift `LatticeNodeCommand.loadOrCreateIdentity` refuses existing identity
+files with group/other permissions. The Rust daemon now checks permissions and
+regular-file type on the same descriptor it reads, with a 16 KiB bound. Unix
+opens use `O_NOFOLLOW | O_NONBLOCK`: links are refused and FIFOs cannot block
+before the type check. Creation remains exclusive (`create_new`) with mode 0600;
+existing valid raw hexadecimal and Rust JSON `privateKey` files keep their key.
+No hot identity-rotation API is introduced: pinned Ivy's signing key is immutable
+and both node runtimes load their process identity at startup.
+
+Unit tests cover persisted generation, raw/JSON compatibility, unsafe permissions,
+links (including dangling links), directories/devices and malformed/oversized
+files. The actual daemon test verifies readable keys and a FIFO fail promptly
+before node storage is created, and a normal restart retains the public identity.
+Unix permission checks do not implement Windows ACL validation; Windows has the
+regular-file/size checks but no claimed private-ACL or no-follow enforcement.

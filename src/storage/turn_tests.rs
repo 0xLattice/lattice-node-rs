@@ -448,3 +448,286 @@ fn child_activation_preserves_other_levels_pins_and_rollback_restores_local_rows
         [local.cid].into_iter().collect()
     );
 }
+
+#[test]
+fn joined_failure_cannot_be_swallowed_and_commit_provisional_facts() {
+    let directory = tempfile::tempdir().unwrap();
+    let (storage, mut root, _, _, carrier, _) = fixture(directory.path());
+    let before = storage.journal().import_batches(&["Nexus".into()]).unwrap();
+    let result: Result<(), StoreError> = storage.atomic_fact_turn(|| {
+        import_parent(&storage, &mut root, &carrier)?;
+        let failed: Result<(), StoreError> =
+            storage.fact_turn_or_join(|| Err(StoreError::Corrupt("nested failure".into())));
+        assert!(failed.is_err());
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        storage.journal().import_batches(&["Nexus".into()]).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn one_verified_child_result_commits_unblocked_headers_proofs_and_cursor_together() {
+    use crate::core::{
+        levels::ChildChainCore,
+        stream::{StreamConfig, SyncEffect},
+        sync::{HeaderEntry, LogEntry, PeerId, StreamEntry, StreamPage, SyncMessage},
+    };
+    for failure in ["none", "second_header", "second_proof", "cursor"] {
+        let directory = tempfile::tempdir().unwrap();
+        let (storage, parent, _, _, carrier0, child0) = fixture(directory.path());
+        let mut child1 = child0.clone();
+        child1.parent = Some(Volume::new(child0.clone()).unwrap());
+        child1.height = 1;
+        child1.timestamp = 2000;
+        child1.prev_state = child0.post_state.clone();
+        let mut carrier1 = carrier0.clone();
+        carrier1.nonce += 1;
+        carrier1.children = Header::new(BTreeMap::from([(
+            "Alpha".into(),
+            Volume::new(child1.clone()).unwrap(),
+        )]))
+        .unwrap();
+        for carrier in [&carrier0, &carrier1] {
+            storage
+                .cache_volumes(
+                    "proof-fixture",
+                    &lattice_cashew::volume::serialize_recursive(
+                        &Volume::new(carrier.clone()).unwrap(),
+                        &(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let path = vec!["Nexus".into(), "Alpha".into()];
+        let mut core = ChildChainCore::open(
+            storage.clone(),
+            ChainRuntimeContext::new(path.clone(), None).unwrap(),
+            &parent,
+            vec![],
+            "atomic",
+            StreamConfig::default(),
+            8,
+        )
+        .unwrap();
+        let peer = PeerId {
+            key: "proof-peer".into(),
+            session: 1,
+        };
+        let ready = core.peer_ready(peer.clone(), 3000);
+        let request_id = ready
+            .sync
+            .iter()
+            .find_map(|effect| match effect {
+                SyncEffect::Send(_, SyncMessage::GetStream { request_id, .. }) => Some(*request_id),
+                _ => None,
+            })
+            .unwrap();
+        let cid0 = content_id(&child0).unwrap();
+        let cid1 = content_id(&child1).unwrap();
+        core.stream_page(
+            &peer,
+            StreamPage {
+                request_id,
+                log_id: "remote".into(),
+                has_more: false,
+                entries: vec![
+                    StreamEntry {
+                        position: 1,
+                        entry: LogEntry::header(&cid0),
+                    },
+                    StreamEntry {
+                        position: 2,
+                        entry: LogEntry::header(&cid1),
+                    },
+                ],
+            },
+            3000,
+        )
+        .unwrap();
+        let entry = |child: &Block, carrier: &Block| HeaderEntry {
+            block: child.clone(),
+            children: child.children.node.as_deref().cloned(),
+            spec: child.spec.0.node.as_deref().cloned(),
+            proofs: vec![
+                ChildBlockProof::generate(&content_id(carrier).unwrap(), "Alpha", storage.as_ref())
+                    .unwrap(),
+            ],
+        };
+        // The successor is authenticated first but awaits its missing parent.
+        core.queue_header(entry(&child1, &carrier1), Some(peer.clone()), None, 3000)
+            .unwrap();
+        let first = core.proof_work().checks.remove(0).run(None);
+        storage
+            .fact_turn_or_join(|| core.proof_completed(first, 3000))
+            .unwrap();
+        assert!(!core.tree().contains(&cid1));
+        core.queue_header(entry(&child0, &carrier0), Some(peer.clone()), None, 3000)
+            .unwrap();
+        let completion = core.proof_work().checks.remove(0).run(None);
+        let trigger=match failure {
+            "second_header"=>format!("CREATE TEMP TRIGGER fail_proof_turn BEFORE INSERT ON headers WHEN NEW.cid='{cid1}' BEGIN SELECT RAISE(ABORT,'second header'); END"),
+            "second_proof"=>format!("CREATE TEMP TRIGGER fail_proof_turn BEFORE INSERT ON child_proofs WHEN NEW.child='{cid1}' BEGIN SELECT RAISE(ABORT,'second proof'); END"),
+            "cursor"=>"CREATE TEMP TRIGGER fail_proof_turn BEFORE INSERT ON stream_cursors WHEN NEW.chain_path='Nexus/Alpha' AND NEW.position=2 BEGIN SELECT RAISE(ABORT,'cursor'); END".into(),
+            _=>String::new(),
+        };
+        if !trigger.is_empty() {
+            storage
+                .journal()
+                .db
+                .lock()
+                .unwrap()
+                .execute_batch(&trigger)
+                .unwrap();
+        }
+        let result = storage.fact_turn_or_join(|| core.proof_completed(completion, 3000));
+        assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
+        let saved = storage.journal().recovery_snapshot(&path).unwrap();
+        let committed = failure == "none";
+        assert_eq!(!saved.batches.is_empty(), committed);
+        assert_eq!(
+            saved.cursors[&peer.key].position,
+            if committed { 2 } else { 0 }
+        );
+        let proofs = storage
+            .journal()
+            .saved_proofs(&path, &[cid0.clone(), cid1.clone()])
+            .unwrap();
+        assert_eq!(proofs.len(), if committed { 2 } else { 0 });
+        for cid in [&cid0, &cid1] {
+            assert_eq!(storage.journal().header(cid).unwrap().is_some(), committed);
+        }
+        // Failed provisional cores are dropped, never reused after the error.
+        drop(core);
+        let restored = ChildChainCore::open(
+            storage.clone(),
+            ChainRuntimeContext::new(path.clone(), None).unwrap(),
+            &parent,
+            vec![],
+            "atomic",
+            StreamConfig::default(),
+            8,
+        )
+        .unwrap();
+        assert_eq!(restored.tree().contains(&cid0), committed);
+        assert_eq!(restored.tree().contains(&cid1), committed);
+    }
+}
+
+#[test]
+fn one_derived_result_rolls_back_every_verified_grind_on_later_proof_failure() {
+    use crate::core::{
+        child_proofs::ChildDeriveJob, levels::ChildChainCore, stream::StreamConfig,
+        sync::HeaderEntry,
+    };
+    for fail in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let (storage, _, _, _, mut root_carrier, mut alpha) = fixture(directory.path());
+        let mut beta = funded(&["Nexus", "Alpha", "Beta"]);
+        beta.parent_state = alpha.post_state.clone();
+        alpha.parent = Some(Volume::new(alpha.clone()).unwrap());
+        alpha.prev_state = alpha.post_state.clone();
+        alpha.height = 1;
+        alpha.timestamp = 2000;
+        alpha.children = Header::new(BTreeMap::from([(
+            "Beta".into(),
+            Volume::new(beta.clone()).unwrap(),
+        )]))
+        .unwrap();
+        root_carrier.children = Header::new(BTreeMap::from([(
+            "Alpha".into(),
+            Volume::new(alpha.clone()).unwrap(),
+        )]))
+        .unwrap();
+        let mut upstream = vec![];
+        let mut grinds = BTreeSet::new();
+        for nonce in [101, 102] {
+            root_carrier.nonce = nonce;
+            storage
+                .cache_volumes(
+                    "derive-turn",
+                    &lattice_cashew::volume::serialize_recursive(
+                        &Volume::new(root_carrier.clone()).unwrap(),
+                        &(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let root = content_id(&root_carrier).unwrap();
+            upstream.push(ChildBlockProof::generate(&root, "Alpha", storage.as_ref()).unwrap());
+            grinds.insert(root);
+        }
+        let beta_cid = content_id(&beta).unwrap();
+        let alpha_cid = content_id(&alpha).unwrap();
+        let path = vec!["Nexus".into(), "Alpha".into(), "Beta".into()];
+        let parent = ChainTree::empty(
+            ChainRuntimeContext::new(vec!["Nexus".into(), "Alpha".into()], None).unwrap(),
+        );
+        let mut core = ChildChainCore::open(
+            storage.clone(),
+            ChainRuntimeContext::new(path.clone(), None).unwrap(),
+            &parent,
+            vec![],
+            "atomic",
+            StreamConfig::default(),
+            8,
+        )
+        .unwrap();
+        let hop = ChildBlockProof::generate(&alpha_cid, "Beta", storage.as_ref()).unwrap();
+        upstream[0]
+            .composing(&hop)
+            .verify_securing_work(&beta, &path)
+            .unwrap();
+        core.queue_header(
+            HeaderEntry {
+                block: beta.clone(),
+                children: beta.children.node.as_deref().cloned(),
+                spec: beta.spec.0.node.as_deref().cloned(),
+                proofs: vec![upstream[0].composing(&hop)],
+            },
+            None,
+            None,
+            3000,
+        )
+        .unwrap();
+        // Private job authority still executes both real securing-proof checks.
+        let completion = ChildDeriveJob::new(
+            beta_cid.clone(),
+            Some(beta),
+            alpha_cid,
+            grinds,
+            path.clone(),
+        )
+        .run(None, &upstream, storage.as_ref());
+        if fail {
+            storage.journal().db.lock().unwrap().execute_batch("CREATE TEMP TRIGGER fail_second_derived_proof BEFORE INSERT ON child_proofs WHEN NEW.chain='Nexus/Alpha/Beta' AND (SELECT COUNT(*) FROM child_proofs WHERE chain=NEW.chain)>0 BEGIN SELECT RAISE(ABORT,'second derived proof'); END").unwrap();
+        }
+        let result = storage.fact_turn_or_join(|| core.derivation_completed(completion, 3000));
+        assert_eq!(result.is_err(), fail);
+        let saved = storage
+            .journal()
+            .saved_proofs(&path, std::slice::from_ref(&beta_cid))
+            .unwrap();
+        assert_eq!(
+            saved.get(&beta_cid).map_or(0, Vec::len),
+            if fail { 0 } else { 2 }
+        );
+        assert_eq!(
+            storage.journal().import_batches(&path).unwrap().is_empty(),
+            fail
+        );
+        if !fail {
+            assert_eq!(
+                core.tree()
+                    .consensus_block(&beta_cid)
+                    .unwrap()
+                    .work_contributions
+                    .len(),
+                2
+            );
+        }
+    }
+}

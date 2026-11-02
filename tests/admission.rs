@@ -959,8 +959,27 @@ fn root_body_rejection_requires_real_validation_and_is_durable_before_exclusion(
     let volumes =
         lattice_cashew::volume::serialize_recursive(&Volume::new(child).unwrap(), &()).unwrap();
     storage.cache_volumes(&cid, &volumes).unwrap();
+    let queued = tree.prepare_root_connection(&job).unwrap();
+    // A sibling header can change the live graph while validation is queued.
+    // Invalidity is sealed by the worker, but its exclusion preparation must
+    // use this newer graph, not a revision captured before the sibling arrived.
+    let mut sibling = verified.header().0.node.as_deref().unwrap().clone();
+    sibling.parent = Some(verified.header().clone());
+    sibling.height = 1;
+    sibling.timestamp = 2000;
+    sibling.nonce = 10;
+    storage
+        .import_root_header(
+            &mut tree,
+            &sibling,
+            sibling.children.node.as_deref().unwrap(),
+            2000,
+            "log",
+        )
+        .unwrap();
+    let completion = queued.run(&storage, 2000).unwrap();
     let RootConnectionExecution::Rejected(rejected) =
-        tree.execute_root_connection(&job, &storage, 2000).unwrap()
+        tree.complete_root_connection(completion).unwrap().unwrap()
     else {
         panic!("invented post-state passed validation")
     };
@@ -978,9 +997,15 @@ fn root_body_rejection_requires_real_validation_and_is_durable_before_exclusion(
     else {
         panic!()
     };
+    let duplicate_task = tree.prepare_root_connection(&job).unwrap();
     storage
         .import_root_rejection(&mut tree, rejected, "log")
         .unwrap();
+    assert!(
+        tree.complete_root_connection(duplicate_task.run(&storage, 2000).unwrap())
+            .unwrap()
+            .is_none()
+    );
     assert!(tree.is_excluded_root(&cid));
     assert_eq!(tree.executed_prefix(), Some(hash.as_str()));
     let (recovered, _) = storage

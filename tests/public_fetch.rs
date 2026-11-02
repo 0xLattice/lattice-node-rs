@@ -74,6 +74,16 @@ fn public_capacity_reserves_half_content_budget() {
         (4, 512 << 20, 4),
         (4, 0, 1),
         (1, 1024 << 20, 1),
+        (0, usize::MAX, 0),
+        (4, (256 << 20) - 1, 1),
+        (4, 256 << 20, 2),
+        (4, (256 << 20) + 1, 2),
+        (4, (512 << 20) - 1, 3),
+        (
+            usize::MAX,
+            usize::MAX,
+            usize::MAX / 2 / MAXIMUM_ARCHIVE_BYTES,
+        ),
     ] {
         assert_eq!(
             PublicVolumeFetches::effective_limit(requested, budget),
@@ -110,4 +120,40 @@ fn rpc_archive_is_bound_to_requested_root_and_actual_bytes() {
     corrupted["entries"][&serialized.root] =
         serde_json::json!(base64::engine::general_purpose::STANDARD.encode(b"forged"));
     assert!(decode_rpc_archive(&serialized.root, &corrupted).is_none());
+}
+
+#[tokio::test]
+async fn configured_half_budget_admits_two_distinct_reads_then_recovers() {
+    let source = Arc::new(Fetcher {
+        calls: AtomicUsize::new(0),
+        gate: Arc::new(Semaphore::new(0)),
+    });
+    let fetch = PublicVolumeFetches::new(9, 256 << 20, source.clone());
+    let mut tasks = Vec::new();
+    for cid in ["first", "second"] {
+        let fetch = fetch.clone();
+        tasks.push(tokio::spawn(async move { fetch.archive(cid).await }));
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while source.calls.load(Ordering::SeqCst) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fetch.archive("third").await, FetchAnswer::Busy);
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    source.gate.add_permits(2);
+    for task in tasks {
+        assert!(matches!(task.await.unwrap(), FetchAnswer::Archive(_)));
+    }
+    source.gate.add_permits(1);
+    assert!(matches!(
+        fetch.archive("third").await,
+        FetchAnswer::Archive(_)
+    ));
+    let disabled = PublicVolumeFetches::new(0, usize::MAX, source.clone());
+    assert!(!disabled.enabled());
+    assert_eq!(disabled.archive("disabled").await, FetchAnswer::Busy);
+    assert_eq!(source.calls.load(Ordering::SeqCst), 3);
 }

@@ -217,16 +217,25 @@ impl NodeStorage {
             .broker
             .retained_scopes(&format!("{}:fetch:", self.scope))?
         {
-            let roots = self.broker.retained_roots(&scope)?;
-            self.broker.release_retained_roots(&scope, &roots)?;
+            self.release_cached_scope(&scope)?;
         }
         Ok(())
     }
     pub fn release_cached_volumes(&self, job: &str) -> Result<(), StoreError> {
         let _turn = self.turn.lock().unwrap();
         let scope = format!("{}:fetch:{job}", self.scope);
-        let roots = self.broker.retained_roots(&scope)?;
-        self.broker.release_retained_roots(&scope, &roots)?;
+        self.release_cached_scope(&scope)
+    }
+    fn release_cached_scope(&self, scope: &str) -> Result<(), StoreError> {
+        let mut after = String::new();
+        loop {
+            let roots = self.broker.retained_roots_page(scope, &after, 256)?;
+            let Some(last) = roots.last().cloned() else {
+                break;
+            };
+            self.broker.release_retained_roots(scope, &roots)?;
+            after = last;
+        }
         Ok(())
     }
     pub fn serving_volume(&self, root: &str) -> Result<Option<SerializedVolume>, StoreError> {
@@ -303,7 +312,7 @@ impl NodeStorage {
         )?;
         Ok(())
     }
-    fn retention_scopes(&self) -> RetentionScopes {
+    pub(super) fn retention_scopes(&self) -> RetentionScopes {
         RetentionScopes {
             chain: self.scope.clone(),
         }
@@ -440,6 +449,7 @@ impl NodeStorage {
         let scope = self.retention_scopes().reads(block, path);
         let roots = self.broker.retained_roots(&scope)?;
         self.broker.release_retained_roots(&scope, &roots)?;
+        self.release_prepared_states(block, path)?;
         Ok(())
     }
     /// Drop executed non-genesis bodies except each level's live tip. Pending
@@ -480,6 +490,22 @@ impl NodeStorage {
     pub fn reconcile_read_scopes(&self, policy: StateRetention) -> Result<(), StoreError> {
         let _turn = self.turn.lock().unwrap();
         let scopes = self.retention_scopes();
+        for scope in self.broker.retained_scopes(&scopes.prepared_prefix())? {
+            let Some((path, cid)) = scopes.prepared_block(&scope) else {
+                continue;
+            };
+            if policy == StateRetention::All
+                || matches!(
+                    self.store.block_status(&cid, &path)?,
+                    Some(BlockStatus::Executed | BlockStatus::ExecutedAndPinned)
+                )
+            {
+                if policy == StateRetention::All {
+                    self.copy_state_scope(&scope, &scopes.chain)?;
+                }
+                self.release_prepared_states(&cid, &path)?;
+            }
+        }
         for scope in self.broker.retained_scopes(&scopes.reads_prefix())? {
             let Some((path, cid)) = scopes.block(&scope, true) else {
                 continue;
@@ -490,6 +516,9 @@ impl NodeStorage {
                     Some(BlockStatus::Executed | BlockStatus::ExecutedAndPinned)
                 )
             {
+                if policy == StateRetention::All {
+                    self.copy_state_scope(&scope, &scopes.chain)?;
+                }
                 let roots = self.broker.retained_roots(&scope)?;
                 self.broker.release_retained_roots(&scope, &roots)?;
             }
@@ -511,6 +540,12 @@ impl NodeStorage {
         log_id: &str,
     ) -> Result<(), StoreError> {
         use lattice_primitives::content_id;
+        let _turn = self.turn.lock().unwrap();
+        self.promote_connection_state(
+            &block.post_state.raw_cid,
+            &lattice_primitives::content_id(block)?,
+            &level.path,
+        )?;
         if self.retention == RetentionPolicy::default()
             || (level.path.len() == 1 && block.height == 0)
         {
@@ -610,6 +645,11 @@ impl NodeStorage {
             let _ = self.release_after_fact_commit(&scopes.state(&level.path), &gone);
         }
         let _ = self.release_after_fact_commit(&root_reads, &supplied);
+        self.promote_connection_state(
+            &block.post_state.raw_cid,
+            &lattice_primitives::content_id(block)?,
+            &level.path,
+        )?;
         Ok(())
     }
 }

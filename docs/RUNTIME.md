@@ -157,3 +157,62 @@ Canonical-height reads currently walk parent links; they do not yet use Swift's
 optimized height index. No complete performance or API parity is claimed.
 Existing lattice-formal bridges validate finite consensus/recovery traces;
 they do not currently prove host scheduling, HTTP serving, or process lifecycle.
+
+## Detached root body validation
+
+Root `BodyEffect::Connect` now captures a sealed `RootConnectionTask` from the
+live graph: root context, block, executed parent and inherited difficulty anchor.
+The task does not clone the graph. It validates against an immutable WAL content
+snapshot in the shared four-worker-cap execution/mining pool; pending execution
+jobs take the next free slot before mining jobs. Already-running blocking jobs
+are not preempted. Root/child preflight and merged template assembly share this
+cap; synchronous scoped proof verification remains a separate executor.
+
+Only actual validation can construct the completion. The actor rechecks current
+root/parent/anchor facts and prepares accepted or excluded facts against the live
+graph, inside the existing durable event flow. Unlike mining jobs, execution has
+no tip-epoch fence: pinned Swift `BodyPipeline.swift` explicitly permits valid
+side-fork execution after tip movement. Issued-worker ownership is independent
+of body-fetch ownership, so a delayed failed fetch or cancellation cannot revoke
+an authentic running verdict. Duplicate/excluded/changed-basis completions are
+harmless or return to normal scheduling, never an unsolicited-result fail-stop.
+An actual storage failure during admission still stops the actor and releases no
+success response.
+
+Fetched/mined root body scopes remain retained while waiting for worker capacity.
+The worker and its completed result own these scopes, the WAL snapshot, and the
+storage directory lease until live admission and the resulting synchronous drain
+finish. Before completion, the worker restores reachable locally available
+output and read dependencies from that snapshot and pins each restored Volume
+under the sweep gate. Its disk-backed SQLite frontier avoids a Rust collection
+of the entire reachable state and imposes no new state-size consensus cutoff.
+Typed state traversal reconstructs exact independent Volume boundaries when
+bytes exist only inside another complete Volume; existing manifests are
+preserved unchanged. Wholly unavailable subtrees remain unavailable.
+
+Actual root or child execution adopts the matching post-state lease before
+committing facts. Speculative carried child state grants no execution authority.
+Temporary leases survive descendant work and are then released; failure may
+conservatively leave cache pins for startup cleanup. State adoption uses bounded
+256-root pages, but its total synchronous work still scales with the available
+output state; this is not full scheduling/performance parity. The worker's RAM
+also includes its already-materialized validator output and its largest Volume.
+No whole-store retention scan or arbitrary state-size rejection is introduced.
+Unwanted queued scopes are released against the current body window. Snapshot
+WAL growth and nonpreemptive policy execution retain the limits described in
+`PORTING.md`.
+
+Mining replies remain pending until execution/exclusion is durable. The Swift
+`answerSideMined` exception is preserved: a held off-canonical header outside the
+fork-child execution window receives `acceptedSide` without claiming execution;
+an already-issued worker may still validate that side fork later.
+
+Actual single-thread actor tests hold real worker completions while status and
+reorg/fetch events proceed, execute a valid side fork after its fetch slot is
+lost, verify the accepted-side reply before validation ends, saturate the shared
+pool and sweep queued mined content without losing it, and inject a SQL failure
+after header admission but before worker completion to check fail-stop/recovery.
+Admission tests also prepare an invalid result before an unrelated sibling
+arrives, then durably exclude it on the new graph and ignore a duplicate late
+completion. Graph admission/preparation and persistence still run synchronously;
+this is a validation scheduling boundary, not complete performance parity.

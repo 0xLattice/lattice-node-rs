@@ -64,13 +64,37 @@ skipped before snapshot creation. A running blocking job keeps its snapshot and
 storage lease until it exits even when its requester disconnects.
 
 The actor still selects child contexts and reads their headers synchronously.
-The separate `/child-blocks/build` authoring route still assembles synchronously;
-this change does not claim a fully asynchronous runtime. Snapshot cache, WAL
-lifetime and cancellation limits are the same as the preflight pool described in
-`PORTING.md`. Unit tests exercise the actual single-thread host while a completed
+`/child-blocks/build` uses the same template request, worker pool, whole-host
+fence, retry and cancellation path. Its reply extracts the selected child and
+stores the same candidate content as before; this confers no admission authority.
+Candidate storage still runs on the actor, so this is not a fully asynchronous
+runtime. Actor tests cover successful child construction, abandoned requests,
+continued command handling while assembly is held, and refusal of an old child
+candidate after unhosting. Each snapshot uses the same page-cache target as
+transaction preflight; template ownership lasts longer, as described below. Unit tests exercise the actual single-thread host while a completed
 assembly worker is held: status and child-hosting requests proceed, a changed
 child basis discards the old result, and both waiting callers receive rebuilt
 work. Reducer tests cover retry exhaustion and late completion generations;
 additional actor tests check queued/running cancellation, coalesced ingress
 saturation, and a stale policy-refusal map naming a live transaction CID without
 removing it from the current pool before retry.
+
+## Issued-work content lifetime
+
+Whole-host fences do not replace content ownership: under state retention `none`,
+a pre-weighed side fork can execute without changing the template basis and let
+go of state the issued candidate still references. Assembly therefore preserves
+available state and content boundaries on its blocking worker. The completion's
+lease moves into the bounded work book's corresponding work ID and is released
+on expiry or eviction. A valid nonce submission transfers shared ownership
+through the queued mining effect and queued root connection until its new WAL
+snapshot has captured those inputs. HTTP cancellation does not cancel an
+already accepted mining effect or release its content early.
+
+These leases retain CAS roots, the storage-directory lifetime and WAL readers.
+Live readers can therefore outnumber the blocking workers: issued work and
+accepted queued submissions hold their own bounded ownership. WAL growth and
+snapshot age have no independent absolute bound. Candidate storage uses read
+retention, not executed-state authority; only verified execution adopts state.
+Tests exercise issued work across side-fork execution and sweep, and cancelled
+submission with an evicted work entry while the shared worker pool is saturated.

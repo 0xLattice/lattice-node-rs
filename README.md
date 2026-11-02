@@ -29,3 +29,9 @@ are implemented with actual Swift differential corpora. Consensus replay lives i
 See [PORTING.md](PORTING.md) for exact source pins, coverage, differences and
 remaining work. See [docs/RUNTIME.md](docs/RUNTIME.md) for the runnable CLI,
 bootstrap configuration, authentication and tested runtime limits.
+
+Browser peers can use `/ivy` on the daemon's `webSocketPort` (TCP WebSocket and
+same-port UDP STUN). Omit it to try port 4002, set it to zero to disable, or set a
+nonzero port to require binding. An omitted setting is disabled when public
+reads use port 4002. `externalAddress` accepts an IP literal for the advertised
+TCP overlay endpoint. The listener serves plain WS; use a TLS proxy for WSS.

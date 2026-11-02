@@ -35,6 +35,7 @@ pub struct RootHeaderPool {
     pub pending: PendingQueue,
     pub declined: DeclinedSet,
     pub config: HeaderConfig,
+    finality_height: u64,
 }
 #[derive(Debug, Default)]
 pub struct HeaderTurn {
@@ -45,9 +46,14 @@ pub struct HeaderTurn {
 }
 impl RootHeaderPool {
     fn past_finality(&self, tree: &ChainTree, height: u64) -> bool {
-        self.config
-            .finality
-            .is_some_and(|w| tree.highest_block_height().saturating_sub(height) > w)
+        super::finality::past(tree, height, self.config.finality)
+    }
+    pub(crate) fn refresh_finality(&mut self, tree: &ChainTree) {
+        let height = super::finality::height(tree);
+        if height < self.finality_height {
+            self.declined = DeclinedSet::default();
+        }
+        self.finality_height = height;
     }
     pub fn drop_peer(&mut self, peer: &PeerId) {
         for cid in self.pending.entries().keys().cloned().collect::<Vec<_>>() {

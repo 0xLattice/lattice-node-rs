@@ -404,7 +404,7 @@ queued effects, commands and transport events continue. This adds no unbounded
 and pool limits remain the reducer's existing limits; this is not a new global
 byte budget across every host work queue.
 
-Each prepared task owns a read-only SQLite WAL content snapshot, fixed before
+Each prepared transaction-preflight task owns a read-only SQLite WAL content snapshot, fixed before
 offload under the storage turn gate. It sees complete authenticated volume entries
 as of that committed turn, including content later deleted by retention, and
 cannot see later writes. This avoids walking/copying all held roots. Each snapshot
@@ -435,9 +435,12 @@ preflight worker boundary from pinned Swift `NodeRuntime.swift` and
 `NodeRuntime+API.swift`'s mining-job queue. Merged `/mining/templates` assembly
 now shares this pool and fences every hosted-level basis before policy refusals
 or work issuance; see `docs/MERGED_TEMPLATES.md` for bounded retries, cancellation
-and actor tests. Root transitions, explicit child-author assembly and proof
-batches remain separate scheduling work; full asynchronous executor parity is
-not claimed.
+and actor tests. Root body transitions also use this shared pool, with execution
+jobs prioritized over queued mining jobs and live atomic admission after worker
+validation; see `docs/RUNTIME.md`. The `/child-blocks/build` authoring route now requests a template through that
+same worker/reducer path before extracting and storing its child candidate.
+Context selection, candidate persistence and scoped proof batches remain
+synchronous actor work; full asynchronous executor parity is not claimed.
 
 ### Explicit peer reconnect wiring
 
@@ -466,6 +469,14 @@ before node storage is created, and a normal restart retains the public identity
 Unix permission checks do not implement Windows ACL validation; Windows has the
 regular-file/size checks but no claimed private-ACL or no-follow enforcement.
 
+The authenticated child-index [formal recovery bridge](docs/FORMAL_INDEX_RECOVERY.md)
+exports real verified pending-header/index completion and cold-reopen observations
+through unchanged pinned `Recovery.tla` operators. Its per-level model comparisons
+are distinct from the production event-footprint/SQLite assertions; it does not
+prove the multilevel Host schedule or full NodeCore. Run
+`python3.12 tools/formal-index-recovery-check.py` for the observations and negative
+controls, with machine-independent reports under `target/`.
+
 ## Windows serving-ledger publication
 
 Operator credit still persists before mutating the shared Tally. The temporary
@@ -477,10 +488,79 @@ notSaved. The exact Windows helper cross-compiles for x86_64-pc-windows-msvc;
 actual Windows behavior is gated by the existing credit/reopen/failure tests
 and runtime-host restart test in CI, not inferred from the cross-check.
 
-The authenticated child-index [formal recovery bridge](docs/FORMAL_INDEX_RECOVERY.md)
-exports real verified pending-header/index completion and cold-reopen observations
-through unchanged pinned `Recovery.tla` operators. Its per-level model comparisons
-are distinct from the production event-footprint/SQLite assertions; it does not
-prove the multilevel Host schedule or full NodeCore. Run
-`python3.12 tools/formal-index-recovery-check.py` for the observations and negative
-controls, with machine-independent reports under `target/`.
+Node-local [finality windows](docs/FINALITY.md) now propagate default/per-chain
+configuration through root and hosted ingestion and optional decimal chain-info
+responses. Zero overrides disable the default. Declined old headers/proofs no
+longer stall durable cursors, and a shorter canonical header tip reopens the
+window. Original Swift selector/boundary extraction supplies 1,200 observations;
+authenticated core and localhost host/restart tests provide separate scheduling
+and persistence evidence.
+
+## Browser overlay listener and external address
+
+Daemon `webSocketPort` follows the pinned Swift listener selection: omitted
+tries port 4002 (unless it is the public-read port), zero disables it, and an
+explicit nonzero port must bind successfully. TCP WebSocket `/ivy` and UDP STUN
+bind together; a failed UDP bind releases TCP. Ivy authenticates the resulting
+byte stream, with at most 256 pending HTTP upgrades and a ten-second upgrade
+limit. Shutdown owns pending upgrades and both listeners. Browser relay support
+is enabled when the paired listener is available. No TLS terminator or trusted
+forwarding-header support is introduced; WSS requires an operator's TLS proxy.
+
+`externalAddress` is an IP literal advertised with the node's TCP overlay port,
+through Ivy's existing self-described endpoint mechanism. Managed topology's
+`webSocket` and `externalAddress` fields now reach these daemon options.
+Programmatic Host startup retains its opt-in overlay configuration, so embedded
+hosts do not unexpectedly open the daemon's default browser listener.
+
+Tests authenticate an Ivy peer over WebSocket, complete the Lattice hello,
+check the advertised external endpoint, query same-port STUN, and verify wrong
+path refusal, failed paired bind cleanup, optional/required bind behavior, and
+shutdown socket release. The dedicated SDK worker verification is separate
+HTTP/WASM evidence; it does not establish browser-to-browser relay or NAT punch
+interoperability with this daemon.
+
+`python3.12 tools/overlay-node-integration.py` additionally builds and runs the
+actual daemon with source and executable hashes: configured JSON starts the
+paired listener, raw HTTP upgrades and UDP STUN succeed, shutdown releases both
+ports, and an explicitly disabled listener restarts even when both ports are
+occupied. Reports remain in `target/overlay-node-integration/`; these are local
+process tests, not evidence of public proxy/NAT deployment behavior.
+
+## Root worker content lifetime
+
+Root transition results retain their content snapshot and temporary CAS scopes
+through live admission and the resulting descendant drain. The worker restores
+only reachable available dependencies using a private disk-backed frontier.
+Typed state boundaries are reconstructed when their bytes are readable only as
+members of another complete Volume; existing exact manifests remain unchanged.
+An admitted root or child execution adopts its matching post-state roots before
+facts commit. Speculative child preparation grants no execution authority.
+
+The completed-result regression replaces the executed branch and sweeps while a
+valid old result waits, then checks reused state remains available after admission
+and lease release. A separate storage regression spans more than 256 roots in all
+four state dictionaries, absent exact manifests, swept/unswept containing
+Volumes, All/Tip/None policies, child-path persistence and late fact-turn rollback.
+These are storage/executor tests, not an extension of the finite formal model.
+
+The frontier and transfer pages bound new traversal collections, not total actor
+memory or latency. Existing None-policy previous-root sets, Tip accounting and
+serialized materialized outputs still scale with state. No absolute reachable
+state size rejection or full scheduling/performance parity is claimed. Snapshot
+WAL growth and the largest complete Volume remain resource considerations.
+
+Shared acquisition/serving configuration now reaches the production adapter;
+see [acquisition scope and validation](docs/ACQUISITION.md). Saturation queues
+remote sessions, with live frontier/depth/FIFO ordering and reservations held
+through cancellation acknowledgment and host consumption. This is not an RSS
+bound or a replacement for durable content-retention ownership.
+
+Prepared child candidates retain a separate exact-state classification alongside
+their ordinary read scope. Delayed execution adopts those classified roots even
+after the originating template expires; read-scope reconciliation then releases
+both temporary owners. Body/spec roots are not promoted as state. The regression
+also reopens Tip/None stores with All retention and verifies migration to chain
+ownership precedes old-scope cleanup. These delayed candidate cases exercise the
+real storage persistence hook; they do not replace authenticated child protocol
+tests or claim a new formal proof of retention.

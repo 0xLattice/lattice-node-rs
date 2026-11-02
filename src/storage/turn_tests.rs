@@ -1,4 +1,5 @@
 //! Real authenticated header imports exercise the production turn boundary.
+mod finality;
 mod formal_index;
 use super::*;
 use lattice_block_tree::{ChainTree, ChildBlockProof};

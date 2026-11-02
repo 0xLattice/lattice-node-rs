@@ -198,7 +198,9 @@ impl NodeStorage {
         if let Some(pending) = self.turn_releases.lock().unwrap().as_mut() {
             for (old_scope, old_roots) in pending {
                 if old_scope == scope {
-                    old_roots.retain(|root| !roots.contains(root));
+                    for root in roots {
+                        old_roots.remove(root);
+                    }
                 }
             }
         }

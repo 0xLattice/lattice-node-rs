@@ -51,6 +51,21 @@ impl RetentionScopes {
     pub fn reads(&self, cid: &str, path: &[String]) -> String {
         format!("{}{}:{cid}", self.reads_prefix(), path.join("/"))
     }
+    pub(super) fn prepared_prefix(&self) -> String {
+        format!("{}:prepared-state:", self.chain)
+    }
+    pub(super) fn prepared_block_prefix(&self, cid: &str, path: &[String]) -> String {
+        format!("{}{}:{cid}:", self.prepared_prefix(), path.join("/"))
+    }
+    pub(super) fn prepared(&self, state: &str, cid: &str, path: &[String]) -> String {
+        format!("{}{state}", self.prepared_block_prefix(cid, path))
+    }
+    pub(super) fn prepared_block(&self, scope: &str) -> Option<(Vec<String>, String)> {
+        let rest = scope.strip_prefix(&self.prepared_prefix())?;
+        let (block, _) = rest.rsplit_once(':')?;
+        let (path, cid) = block.rsplit_once(':')?;
+        Some((path.split('/').map(str::to_owned).collect(), cid.to_owned()))
+    }
     pub fn operator_pins(&self) -> String {
         format!("{}:operator", self.chain)
     }
@@ -71,8 +86,8 @@ impl RetentionScopes {
     }
 }
 
-#[derive(Clone)]
-enum StateHeader {
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) enum StateHeader {
     State(Volume<LatticeState>),
     Numbers(Volume<VolumeMerkleDictionary<u64>>),
     Strings(Volume<VolumeMerkleDictionary<String>>),
@@ -80,7 +95,7 @@ enum StateHeader {
     StringNode(Volume<VolumeRadixNode<String>>),
 }
 impl StateHeader {
-    fn cid(&self) -> &str {
+    pub(super) fn cid(&self) -> &str {
         match self {
             Self::State(h) => &h.raw_cid,
             Self::Numbers(h) => &h.raw_cid,
@@ -89,7 +104,27 @@ impl StateHeader {
             Self::StringNode(h) => &h.raw_cid,
         }
     }
-    fn children(&self, source: &impl ContentSource) -> Result<Vec<Self>, lattice_cashew::Error> {
+    pub(super) fn materialize(
+        &self,
+        source: &impl ContentSource,
+    ) -> Result<Vec<lattice_cashew::SerializedVolume>, lattice_cashew::Error> {
+        macro_rules! resolve {
+            ($h:expr) => {
+                lattice_cashew::volume::serialize_recursive(&$h.resolve(source, None)?, &())
+            };
+        }
+        match self {
+            Self::State(h) => resolve!(h),
+            Self::Numbers(h) => resolve!(h),
+            Self::Strings(h) => resolve!(h),
+            Self::NumberNode(h) => resolve!(h),
+            Self::StringNode(h) => resolve!(h),
+        }
+    }
+    pub(super) fn children(
+        &self,
+        source: &impl ContentSource,
+    ) -> Result<Vec<Self>, lattice_cashew::Error> {
         macro_rules! nodes {
             ($h:expr, $kind:ident) => {{
                 let resolved = $h.resolve(source, None)?;

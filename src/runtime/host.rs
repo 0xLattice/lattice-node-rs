@@ -9,6 +9,7 @@ pub use read_endpoints::ReadEndpointConfig;
 mod child_mining;
 mod children;
 mod configuration;
+mod connections;
 mod health;
 mod preflight;
 mod proofs;
@@ -17,6 +18,7 @@ mod retention;
 mod templates;
 mod validation;
 use super::network::{Network, NetworkEvent};
+pub use crate::core::finality::FinalityWindows;
 use crate::{
     core::{
         body::BodyEffect,
@@ -56,6 +58,7 @@ pub struct HostHandle {
 pub struct RunningHost {
     pub handle: HostHandle,
     pub overlay_addr: SocketAddr,
+    pub websocket_addr: Option<SocketAddr>,
     pub public_key: String,
     pub task: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
@@ -109,6 +112,7 @@ enum Fetch {
 enum Work {
     ReadEndpoints(u64, Vec<String>),
     Chain(ChainEffects),
+    RootConnect(lattice_block_tree::ConnectJob),
     Child(Vec<String>, ChainEffects),
     ChildMining(Vec<String>, Box<MiningEffect>),
     HostLevels(u64, configuration::HostedConfiguration),
@@ -124,6 +128,7 @@ struct Host {
     preflights: preflight::Preflights,
     health: health::PublishedHealth,
     read_endpoint_config: ReadEndpointConfig,
+    finality: FinalityWindows,
     chain: RootChainCore,
     levels: crate::core::levels::HostedLevels,
     child_mining: BTreeMap<Vec<String>, child_mining::ChildMining>,
@@ -138,10 +143,17 @@ struct Host {
     fetches: BTreeMap<u64, Fetch>,
     served: BTreeMap<u64, (PeerId, u64)>,
     replies: BTreeMap<u64, oneshot::Sender<(u16, Value)>>,
+    child_build_replies: BTreeMap<u64, Vec<String>>,
+    template_content: BTreeMap<String, Arc<crate::storage::ConnectionContent>>,
+    submitted_template_content: BTreeMap<u64, Arc<crate::storage::ConnectionContent>>,
+    queued_template_content: BTreeMap<String, Arc<crate::storage::ConnectionContent>>,
     next: u64,
     queue: VecDeque<Work>,
     mined_replies: Vec<MinedReply>,
     transient: Vec<String>,
+    connection_pins: BTreeMap<String, Vec<String>>,
+    completed_connection_content: Vec<crate::storage::ConnectionContent>,
+    active_connections: BTreeSet<String>,
     needs_fetch: BTreeSet<String>,
     executed_children: BTreeSet<String>,
     discovery: discovery::Discovery,
@@ -180,6 +192,8 @@ pub async fn start_with_read_endpoints(
         discovery_config,
         read_endpoint_config,
         None,
+        FinalityWindows::default(),
+        super::network::OverlayConfig::default(),
     )
     .await
 }
@@ -192,6 +206,46 @@ pub async fn start_with_hosted_configuration(
     read_endpoint_config: ReadEndpointConfig,
     hosting: Value,
 ) -> anyhow::Result<RunningHost> {
+    start_with_hosted_finality_configuration(
+        config,
+        retention,
+        discovery_config,
+        read_endpoint_config,
+        hosting,
+        FinalityWindows::default(),
+    )
+    .await
+}
+/// As above, with node-local finality defaults and per-chain overrides.
+pub async fn start_with_hosted_finality_configuration(
+    config: HostConfig,
+    retention: crate::storage::RetentionPolicy,
+    discovery_config: DiscoveryConfig,
+    read_endpoint_config: ReadEndpointConfig,
+    hosting: Value,
+    finality: FinalityWindows,
+) -> anyhow::Result<RunningHost> {
+    start_with_hosted_overlay_configuration(
+        config,
+        retention,
+        discovery_config,
+        read_endpoint_config,
+        hosting,
+        finality,
+        super::network::OverlayConfig::default(),
+    )
+    .await
+}
+/// Start the hosted tree with configured browser listeners and advertised address.
+pub async fn start_with_hosted_overlay_configuration(
+    config: HostConfig,
+    retention: crate::storage::RetentionPolicy,
+    discovery_config: DiscoveryConfig,
+    read_endpoint_config: ReadEndpointConfig,
+    hosting: Value,
+    finality: FinalityWindows,
+    overlay: super::network::OverlayConfig,
+) -> anyhow::Result<RunningHost> {
     let hosting = configuration::parse(&hosting)?;
     start_inner(
         config,
@@ -199,6 +253,8 @@ pub async fn start_with_hosted_configuration(
         discovery_config,
         read_endpoint_config,
         Some(hosting),
+        finality,
+        overlay,
     )
     .await
 }
@@ -208,6 +264,8 @@ async fn start_inner(
     discovery_config: DiscoveryConfig,
     read_endpoint_config: ReadEndpointConfig,
     initial_hosting: Option<configuration::HostedConfiguration>,
+    finality: FinalityWindows,
+    overlay: super::network::OverlayConfig,
 ) -> anyhow::Result<RunningHost> {
     read_endpoint_config.validate()?;
     discovery_config.validate()?;
@@ -221,13 +279,14 @@ async fn start_inner(
     storage.cache_volumes("bootstrap", &config.bootstrap_volumes)?;
     let header = Volume(Header::from_cid(&config.genesis_cid)?);
     let genesis = lattice_validation::validate_root_genesis(&header, storage.as_ref(), now())?;
-    let chain = RootChainCore::open(
+    let mut chain = RootChainCore::open(
         storage.clone(),
         &genesis,
         &format!("{}-{}", now(), std::process::id()),
         StreamConfig::default(),
         64,
     )?;
+    chain.set_finality_window(finality.window(&["Nexus".into()]));
     storage.release_cached_volumes("bootstrap")?;
     let state = MiningState::new(
         chain.tree().executed_prefix().unwrap().into(),
@@ -243,13 +302,14 @@ async fn start_inner(
     let (mining, restored) =
         DurableMiningCore::restore(state, storage.clone(), &["Nexus".into()], now())?;
     let ledger = super::serving::ServingLedger::open(&config.directory)?;
-    let mut network = Network::bind_with_configured_peers(
+    let mut network = Network::bind_with_overlay(
         config.listen,
         config.signing_key,
         config.genesis_cid.clone(),
         storage.clone(),
         ledger.tally(),
         config.seeds.clone(),
+        overlay,
     )
     .await?;
     network.configure_read_endpoints(
@@ -281,6 +341,7 @@ async fn start_inner(
         .journal()
         .executed_child_directories(&["Nexus".into()])?;
     let overlay_addr = network.address;
+    let websocket_addr = network.websocket_address;
     let public_key = network.public_key.clone();
     let (commands, input) = mpsc::channel(128);
     let health = health::PublishedHealth::default();
@@ -288,6 +349,7 @@ async fn start_inner(
         preflights: preflight::Preflights::default(),
         health: health.clone(),
         read_endpoint_config,
+        finality,
         chain,
         levels: Default::default(),
         child_settings: Default::default(),
@@ -302,9 +364,16 @@ async fn start_inner(
         fetches: BTreeMap::new(),
         served: BTreeMap::new(),
         replies: BTreeMap::new(),
+        child_build_replies: BTreeMap::new(),
+        template_content: BTreeMap::new(),
+        submitted_template_content: BTreeMap::new(),
+        queued_template_content: BTreeMap::new(),
         next: 1,
         mined_replies: vec![],
         transient: vec![],
+        connection_pins: Default::default(),
+        completed_connection_content: vec![],
+        active_connections: Default::default(),
         needs_fetch: BTreeSet::new(),
         executed_children,
         discovery,
@@ -324,6 +393,7 @@ async fn start_inner(
     Ok(RunningHost {
         handle: HostHandle { commands, health },
         overlay_addr,
+        websocket_addr,
         public_key,
         task,
     })
@@ -355,6 +425,8 @@ impl Host {
         Ok(())
     }
     fn reply(&mut self, id: u64, value: (u16, Value)) {
+        self.child_build_replies.remove(&id);
+        self.submitted_template_content.remove(&id);
         if let Some(reply) = self.replies.remove(&id) {
             let _ = reply.send(value);
         }
@@ -438,6 +510,11 @@ impl Host {
             self.cancel_abandoned_fetches().await?;
             self.cancel_abandoned_templates();
             self.drain().await?;
+            let mut next = self.chain.acquisition_frontier();
+            for path in self.levels.ordered() {
+                next.extend(self.levels.get(&path).unwrap().acquisition_frontier());
+            }
+            self.network.prioritize_acquisitions(next);
             self.publish_health();
             self.maintain_retention();
             self.maintain_discovery().await?;
@@ -445,6 +522,7 @@ impl Host {
              completion=self.preflights.next(), if self.preflights.active()=>{
                 match completion? {
                     preflight::Completion::Template(done)=>self.complete_template(*done)?,
+                    preflight::Completion::Connection(done)=>self.complete_connection(done)?,
                     preflight::Completion::Root(done)=>{
                         let effects=self.mining.complete_root_preflight(done,now())?;
                         self.enqueue(effects);
@@ -565,7 +643,7 @@ impl Host {
                     self.network.requeue_unavailable(id);
                 }
             }
-            NetworkEvent::Fetched(id, volumes) => {
+            NetworkEvent::Fetched(id, volumes, _reservation) => {
                 if let Some(fetch) = self.fetches.remove(&id) {
                     if let Fetch::Operator(root) = fetch {
                         use base64::Engine;
@@ -584,7 +662,14 @@ impl Host {
                     if let Some(volumes) = &volumes {
                         let scope = format!("network-{id}");
                         self.storage.cache_volumes(&scope, volumes)?;
-                        self.transient.push(scope);
+                        if let Fetch::Body(cid) = &fetch {
+                            self.connection_pins
+                                .entry(cid.clone())
+                                .or_default()
+                                .push(scope);
+                        } else {
+                            self.transient.push(scope);
+                        }
                     }
                     match fetch {
                         Fetch::Operator(_) => unreachable!(),
@@ -658,78 +743,261 @@ impl Host {
     }
     async fn drain(&mut self) -> anyhow::Result<()> {
         let mut deferred_preflights = VecDeque::new();
+        let mut deferred_connections = VecDeque::new();
         while let Some(work) = self.queue.pop_front() {
             match work {
-   Work::ReadEndpoints(id,path)=>self.network.lookup_read_endpoints(id,path).await?,
-   Work::ChildMining(path,effect)=>{
-    if let MiningEffect::Preflight(job)=effect.as_ref() {
-     if self.child_mining.get(&path).is_none_or(|m|m.core.state().tip_epoch()!=job.tip_epoch){continue;}
-     deferred_preflights.push_back(Work::ChildMining(path,effect));continue;
-    }
-    self.child_mining_effect(path,*effect).await?;
-   },
-   Work::HostLevels(id,paths)=>{let response=match self.configure_children(paths).await{Ok(())=>(200,json!({"chains":self.levels.ordered().iter().map(|p|p.join("/")).collect::<Vec<_>>()})),Err(e)=>error(e)};self.reply(id,response);},
-   Work::Child(path,effects)=>self.child_effects(path,effects).await?,
-   Work::OperatorFetch(id,cid)=>{if self.fetches.contains_key(&id){self.network.retrieve(id,cid).await?;}},
-   Work::Chain(effects)=>{
-    for effect in effects.sync {match effect {
-     SyncEffect::Send(peer,message)=>{let(topic,bytes)=wire::encode(&message,&["Nexus".into()])?;self.network.send(peer,topic.into(),bytes,0).await?;},
-     SyncEffect::DisconnectStalled(peer)=>self.network.disconnect(&peer).await?,
-     SyncEffect::ServeHeaders{peer,token,request_id,cids,has_more}=>{
-      let mut entries=vec![];for cid in cids {if let Some((block,children))=self.storage.journal().header(&cid)?{entries.push(HeaderEntry{block,children:Some(children),proofs:vec![],spec:None});}}
-      let mut response=HeadersResponse{request_id,entries,has_more};
-      let(topic,bytes)=loop {match wire::encode(&SyncMessage::Headers(response.clone()),&["Nexus".into()]){Ok(value)=>break value,Err(wire::WireError::Oversized)if !response.entries.is_empty()=>{response.entries.pop();response.has_more=true;},Err(error)=>return Err(error.into())}};
-      let id=self.id()?;self.served.insert(id,(peer.clone(),token));self.network.send(peer,topic.into(),bytes,id).await?;
-     }
-    }}
-    for effect in effects.headers {match effect {HeaderEffect::DisconnectInvalidProof(peer)=>self.network.disconnect_invalid_proof(&peer).await?,HeaderEffect::FetchChildIndex{peer,cid}=>{let id=self.id()?;self.fetches.insert(id,Fetch::Index(peer.clone(),cid.clone()));self.network.fetch(id,cid,false,Some(&peer)).await?;}}}
-    for effect in effects.bodies {match effect {
-     BodyEffect::Fetch(cid)=>{if !self.needs_fetch.contains(&cid)&&self.storage.fetch_volume(&cid).is_some(){let effects=self.chain.body_arrived(&cid,now());self.queue.push_back(Work::Chain(effects));}else{let id=self.id()?;self.fetches.insert(id,Fetch::Body(cid.clone()));self.network.fetch(id,cid,true,None).await?;}},
-     BodyEffect::Cancel(cid)=>{let ids:Vec<_>=self.fetches.iter().filter_map(|(id,f)|matches!(f,Fetch::Body(root) if root==&cid).then_some(*id)).collect();for id in ids {self.fetches.remove(&id);self.network.cancel_fetch(id).await?;}self.needs_fetch.remove(&cid);},
-     BodyEffect::Connect(job)=>{
-      let storage=self.storage.clone();
-      storage.atomic_fact_turn(|| -> anyhow::Result<()> {
-      let effect=match self.chain.tree().execute_root_connection(&job,self.storage.as_ref(),now())? {
-       lattice_block_tree::RootConnectionExecution::Accepted(verified)=>{self.needs_fetch.remove(job.block_hash());let effects=self.chain.connected_root(&verified,now())?;if let Some(block)=verified.header().0.node.as_ref()&& let Some(children)=block.children.node.as_ref(){self.executed_children.extend(children.keys().cloned());}effects},
-       lattice_block_tree::RootConnectionExecution::Rejected(rejected)=>self.chain.connected_rejected(rejected,now())?,
-       lattice_block_tree::RootConnectionExecution::Unavailable=>{self.needs_fetch.insert(job.block_hash().into());self.chain.body_unavailable(job.block_hash(),now())},
-      };self.queue.push_back(Work::Chain(effect));self.tip_changed()?;self.wake_children()?;
-      Ok(())
-      })?;
-     }
-    }}
-   },
-   Work::Mining(effect)=>match *effect {
-    MiningEffect::Preflight(job)=>{
-     if job.tip_epoch != self.mining.state().tip_epoch(){continue;}
-     deferred_preflights.push_back(Work::Mining(Box::new(MiningEffect::Preflight(job))));
-    },
-    MiningEffect::BuildTemplate(job)=>{
-     if self.mining.state().template_job_pending(&job){deferred_preflights.push_back(Work::Mining(Box::new(MiningEffect::BuildTemplate(job))));}
-    },
-    MiningEffect::TemplateIssued(id,t)=>self.reply(id,(200,json!({"workID":t.work_id,"block":t.block,"searchTarget":t.search_target,"targets":t.targets,"chainPath":["Nexus"],"expiresInMilliseconds":t.expires_at.saturating_sub(now()).max(0),"templateDigest":t.digest,"chains":t.chains.iter().map(|c|json!({"chainPath":c.chain_path,"target":c.target,"height":c.height.to_string(),"rewardRecipient":c.reward_recipient})).collect::<Vec<_>>()}))),
-    MiningEffect::TemplateRefused(id,error)|MiningEffect::WorkRefused(id,error)=>self.reply(id,error_fn(error)),
-    MiningEffect::TransactionRefused(id,e)=>self.reply(id,error_fn(e)),
-    MiningEffect::TransactionAdmitted{reply_id,cid,count,bytes}=>self.reply(reply_id,(200,json!({"transactionCID":cid,"mempoolCount":count,"mempoolBytes":bytes}))),
-    MiningEffect::AnnounceTransaction(cid)=>{let bytes=serde_json::to_vec(&json!({"volumeRootCID":cid}))?;for peer in self.network.peers(){self.network.send(peer,super::handshake::TRANSACTION_AVAILABLE.into(),bytes.clone(),0).await?;}},
-    MiningEffect::Mined(id,block)=>{
-     let cid=content_id(&block)?;let header=Volume::new(block.clone())?;let volumes=lattice_cashew::volume::serialize_recursive(&header,&())?;let scope=format!("mined-{cid}");self.storage.cache_volumes(&scope,&volumes)?;self.transient.push(scope);
-     let children=block.children.resolve(self.storage.as_ref(),None)?.node.as_deref().unwrap().clone();
-     let storage=self.storage.clone();
-     let child_proofs=storage.atomic_fact_turn(|| -> anyhow::Result<_> {
-      let effects=self.chain.admit_header(&block,&children,now())?;self.queue.push_back(Work::Chain(effects));
-      self.mined_children(&block)
-     })?;
-     // Reply is deferred until the queued body import crosses the journal barrier.
-     self.mined_replies.push(MinedReply{id,cid,children:child_proofs});
-    },
-    MiningEffect::ReturnTransactions{left,carried}=>{for cid in left {for tx in self.transactions(&cid)?{if !carried.contains(&content_id(&tx)?){self.event(MiningEvent::TransactionReceived(tx,TransactionOrigin::Returned))?;}}}},
-    MiningEffect::PoolChanged(_)=>unreachable!("durable mining consumes pool deltas")
-   }
-  }
+                Work::RootConnect(job) => deferred_connections.push_back(job),
+                Work::ReadEndpoints(id, path) => {
+                    self.network.lookup_read_endpoints(id, path).await?
+                }
+                Work::ChildMining(path, effect) => {
+                    if let MiningEffect::Preflight(job) = effect.as_ref() {
+                        if self
+                            .child_mining
+                            .get(&path)
+                            .is_none_or(|m| m.core.state().tip_epoch() != job.tip_epoch)
+                        {
+                            continue;
+                        }
+                        deferred_preflights.push_back(Work::ChildMining(path, effect));
+                        continue;
+                    }
+                    self.child_mining_effect(path, *effect).await?;
+                }
+                Work::HostLevels(id, paths) => {
+                    let response = match self.configure_children(paths).await {
+                        Ok(()) => (
+                            200,
+                            json!({"chains":self.levels.ordered().iter().map(|p|p.join("/")).collect::<Vec<_>>()}),
+                        ),
+                        Err(e) => error(e),
+                    };
+                    self.reply(id, response);
+                }
+                Work::Child(path, effects) => self.child_effects(path, effects).await?,
+                Work::OperatorFetch(id, cid) => {
+                    if self.fetches.contains_key(&id) {
+                        self.network.retrieve(id, cid).await?;
+                    }
+                }
+                Work::Chain(effects) => {
+                    for effect in effects.sync {
+                        match effect {
+                            SyncEffect::Send(peer, message) => {
+                                let (topic, bytes) = wire::encode(&message, &["Nexus".into()])?;
+                                self.network.send(peer, topic.into(), bytes, 0).await?;
+                            }
+                            SyncEffect::DisconnectStalled(peer) => {
+                                self.network.disconnect(&peer).await?
+                            }
+                            SyncEffect::ServeHeaders {
+                                peer,
+                                token,
+                                request_id,
+                                cids,
+                                has_more,
+                            } => {
+                                let mut entries = vec![];
+                                for cid in cids {
+                                    if let Some((block, children)) =
+                                        self.storage.journal().header(&cid)?
+                                    {
+                                        entries.push(HeaderEntry {
+                                            block,
+                                            children: Some(children),
+                                            proofs: vec![],
+                                            spec: None,
+                                        });
+                                    }
+                                }
+                                let mut response = HeadersResponse {
+                                    request_id,
+                                    entries,
+                                    has_more,
+                                };
+                                let (topic, bytes) = loop {
+                                    match wire::encode(
+                                        &SyncMessage::Headers(response.clone()),
+                                        &["Nexus".into()],
+                                    ) {
+                                        Ok(value) => break value,
+                                        Err(wire::WireError::Oversized)
+                                            if !response.entries.is_empty() =>
+                                        {
+                                            response.entries.pop();
+                                            response.has_more = true;
+                                        }
+                                        Err(error) => return Err(error.into()),
+                                    }
+                                };
+                                let id = self.id()?;
+                                self.served.insert(id, (peer.clone(), token));
+                                self.network.send(peer, topic.into(), bytes, id).await?;
+                            }
+                        }
+                    }
+                    for effect in effects.headers {
+                        match effect {
+                            HeaderEffect::DisconnectInvalidProof(peer) => {
+                                self.network.disconnect_invalid_proof(&peer).await?
+                            }
+                            HeaderEffect::FetchChildIndex { peer, cid } => {
+                                let id = self.id()?;
+                                self.fetches
+                                    .insert(id, Fetch::Index(peer.clone(), cid.clone()));
+                                self.network.fetch(id, cid, false, Some(&peer)).await?;
+                            }
+                        }
+                    }
+                    for effect in effects.bodies {
+                        match effect {
+                            BodyEffect::Fetch(cid) => {
+                                if !self.needs_fetch.contains(&cid)
+                                    && self.storage.fetch_volume(&cid).is_some()
+                                {
+                                    let effects = self.chain.body_arrived(&cid, now());
+                                    self.queue.push_back(Work::Chain(effects));
+                                } else {
+                                    let id = self.id()?;
+                                    self.fetches.insert(id, Fetch::Body(cid.clone()));
+                                    self.network.fetch_body(id, cid, 0, None).await?;
+                                }
+                            }
+                            BodyEffect::Cancel(cid) => {
+                                let ids: Vec<_> = self
+                                    .fetches
+                                    .iter()
+                                    .filter_map(|(id, f)| {
+                                        matches!(f,Fetch::Body(root) if root==&cid).then_some(*id)
+                                    })
+                                    .collect();
+                                for id in ids {
+                                    self.fetches.remove(&id);
+                                    self.network.cancel_fetch(id).await?;
+                                }
+                                self.needs_fetch.remove(&cid);
+                            }
+                            BodyEffect::Connect(job) => {
+                                deferred_connections.push_back(job);
+                            }
+                        }
+                    }
+                }
+                Work::Mining(effect) => match *effect {
+                    MiningEffect::Preflight(job) => {
+                        if job.tip_epoch != self.mining.state().tip_epoch() {
+                            continue;
+                        }
+                        deferred_preflights
+                            .push_back(Work::Mining(Box::new(MiningEffect::Preflight(job))));
+                    }
+                    MiningEffect::BuildTemplate(job) => {
+                        if self.mining.state().template_job_pending(&job) {
+                            deferred_preflights.push_back(Work::Mining(Box::new(
+                                MiningEffect::BuildTemplate(job),
+                            )));
+                        }
+                    }
+                    MiningEffect::TemplateIssued(id, t) => {
+                        if let Some(path) = self.child_build_replies.remove(&id) {
+                            self.complete_child_build(id, path, t.block)?;
+                        } else {
+                            self.reply(id,(200,json!({"workID":t.work_id,"block":t.block,"searchTarget":t.search_target,"targets":t.targets,"chainPath":["Nexus"],"expiresInMilliseconds":t.expires_at.saturating_sub(now()).max(0),"templateDigest":t.digest,"chains":t.chains.iter().map(|c|json!({"chainPath":c.chain_path,"target":c.target,"height":c.height.to_string(),"rewardRecipient":c.reward_recipient})).collect::<Vec<_>>()})));
+                        }
+                    }
+                    MiningEffect::TemplateRefused(id, error)
+                    | MiningEffect::WorkRefused(id, error) => self.reply(id, error_fn(error)),
+                    MiningEffect::TransactionRefused(id, e) => self.reply(id, error_fn(e)),
+                    MiningEffect::TransactionAdmitted {
+                        reply_id,
+                        cid,
+                        count,
+                        bytes,
+                    } => self.reply(
+                        reply_id,
+                        (
+                            200,
+                            json!({"transactionCID":cid,"mempoolCount":count,"mempoolBytes":bytes}),
+                        ),
+                    ),
+                    MiningEffect::AnnounceTransaction(cid) => {
+                        let bytes = serde_json::to_vec(&json!({"volumeRootCID":cid}))?;
+                        for peer in self.network.peers() {
+                            self.network
+                                .send(
+                                    peer,
+                                    super::handshake::TRANSACTION_AVAILABLE.into(),
+                                    bytes.clone(),
+                                    0,
+                                )
+                                .await?;
+                        }
+                    }
+                    MiningEffect::Mined(id, block) => {
+                        let cid = content_id(&block)?;
+                        if let Some(content) = self.submitted_template_content.remove(&id) {
+                            self.queued_template_content.insert(cid.clone(), content);
+                        }
+                        let header = Volume::new(block.clone())?;
+                        let volumes = lattice_cashew::volume::serialize_recursive(&header, &())?;
+                        let scope = format!("mined-{cid}");
+                        self.storage.cache_volumes(&scope, &volumes)?;
+                        self.connection_pins
+                            .entry(cid.clone())
+                            .or_default()
+                            .push(scope);
+                        let children = block
+                            .children
+                            .resolve(self.storage.as_ref(), None)?
+                            .node
+                            .as_deref()
+                            .unwrap()
+                            .clone();
+                        let storage = self.storage.clone();
+                        let child_proofs = storage.atomic_fact_turn(|| -> anyhow::Result<_> {
+                            let effects = self.chain.admit_header(&block, &children, now())?;
+                            self.queue.push_back(Work::Chain(effects));
+                            self.mined_children(&block)
+                        })?;
+                        // Reply is deferred until the queued body import crosses the journal barrier.
+                        self.mined_replies.push(MinedReply {
+                            id,
+                            cid,
+                            children: child_proofs,
+                        });
+                    }
+                    MiningEffect::ReturnTransactions { left, carried } => {
+                        for cid in left {
+                            for tx in self.transactions(&cid)? {
+                                if !carried.contains(&content_id(&tx)?) {
+                                    self.event(MiningEvent::TransactionReceived(
+                                        tx,
+                                        TransactionOrigin::Returned,
+                                    ))?;
+                                }
+                            }
+                        }
+                    }
+                    MiningEffect::PoolChanged(_) => {
+                        unreachable!("durable mining consumes pool deltas")
+                    }
+                },
+            }
         }
         for MinedReply { id, cid, children } in std::mem::take(&mut self.mined_replies) {
-            let accepted = self.chain.tree().is_executed(&cid);
+            let executed = self.chain.tree().is_executed(&cid);
+            // Swift answers held side headers that the body window will not
+            // execute. This acknowledges weighing, not a validation verdict.
+            let side = self.chain.tree().contains(&cid)
+                && !self.chain.tree().canonical_path().contains(&cid)
+                && !crate::core::body::fork_children(self.chain.tree()).contains(&cid);
+            let accepted = executed || (side && !self.chain.tree().is_excluded_root(&cid));
+            if !accepted && !self.chain.tree().is_excluded_root(&cid) {
+                if self.replies.contains_key(&id) {
+                    self.mined_replies.push(MinedReply { id, cid, children });
+                }
+                continue;
+            }
             let disposition = if self.chain.tree().executed_prefix() == Some(cid.as_str()) {
                 "canonicalized"
             } else if accepted {
@@ -770,6 +1038,19 @@ impl Host {
         // Execute current reducer/connection work before scheduling mining CPU
         // jobs, as Swift nextJob prefers its execution queue. Preparation is
         // delayed too, so stale work consumes neither a worker nor a WAL lease.
+        // Swift's execution queue wins the next free worker over mining.
+        // Existing mining workers finish normally; cancellation cannot preempt
+        // blocking work or release its immutable content lease early.
+        while !self.preflights.full() {
+            let Some(job) = deferred_connections.pop_front() else {
+                break;
+            };
+            if let Some(task) = self.prepare_connection(job)? {
+                self.preflights.start_connection(task);
+            }
+        }
+        self.queue
+            .extend(deferred_connections.into_iter().map(Work::RootConnect));
         while !self.preflights.full() {
             let Some(work) = deferred_preflights.pop_front() else {
                 break;
@@ -796,9 +1077,11 @@ impl Host {
             }
         }
         self.queue.extend(deferred_preflights);
+        self.release_unused_connection_pins()?;
         for scope in std::mem::take(&mut self.transient) {
             self.storage.release_cached_volumes(&scope)?;
         }
+        self.completed_connection_content.clear();
         Ok(())
     }
     fn api(
@@ -825,6 +1108,9 @@ impl Host {
                 return Ok(());
             }
             Ok(None) => {}
+        }
+        if route == "/child-blocks/build" {
+            return self.request_child_build(&body, reply);
         }
         if let Some(response) = self.child_author(&route, &body)? {
             let _ = reply.send(response);
@@ -963,6 +1249,11 @@ impl Host {
         };
         match event {
             Ok(event) => {
+                if let MiningEvent::SubmitWork { work_id, .. } = &event
+                    && let Some(content) = self.template_content.get(work_id)
+                {
+                    self.submitted_template_content.insert(id, content.clone());
+                }
                 self.replies.insert(id, reply);
                 match event {
                     MiningEvent::TransactionReceived(tx, origin) => {

@@ -1,6 +1,9 @@
 use lattice_cashew::{SerializedVolume, cid_for_bytes};
 use lattice_node::{
-    runtime::network::{Network, NetworkEvent},
+    runtime::{
+        acquisition::{ResourcePolicy, SESSION_BYTES},
+        network::{Network, NetworkEvent, OverlayConfig},
+    },
     storage::NodeStorage,
 };
 use std::{collections::BTreeMap, sync::Arc};
@@ -19,11 +22,20 @@ async fn real_ivy_sessions_exchange_hello_messages_and_validated_stored_volumes(
     b_store
         .cache_volumes("test", std::slice::from_ref(&volume))
         .unwrap();
-    let mut a = Network::bind(
+    let mut a = Network::bind_with_overlay(
         "127.0.0.1:0".parse().unwrap(),
         ed25519_dalek::SigningKey::from_bytes(&[11; 32]),
         genesis.into(),
         a_store,
+        lattice_tally::Tally::default(),
+        vec![],
+        OverlayConfig {
+            resources: ResourcePolicy {
+                max_acquisition_bytes: SESSION_BYTES,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -69,8 +81,23 @@ async fn real_ivy_sessions_exchange_hello_messages_and_validated_stored_volumes(
             e=b.next()=>if let Some(NetworkEvent::Message(_,topic,bytes))=e.unwrap(){assert_eq!(topic,"test.echo");assert_eq!(bytes,vec![7;200_000]);received=true},
         }}
         a.fetch(88,cid.clone(),false,Some(&peer)).await.unwrap();
+        a.fetch(89,cid.clone(),false,Some(&peer)).await.unwrap();
+        let held = loop {tokio::select!{
+            e=a.next()=>if let Some(NetworkEvent::Fetched(88,volumes,reservation))=e.unwrap(){let volumes=volumes.unwrap();assert_eq!(volumes.len(),1);assert_eq!(volumes[0].root,volume.root);assert_eq!(volumes[0].entries,volume.entries);break reservation},
+            e=b.next()=>{e.unwrap();},
+        }};
+        assert!(held.is_some());
+        // Keep pumping both real actors while the consumer owns the first
+        // completion. The queued second session must not consume capacity.
+        assert!(timeout(Duration::from_millis(100), async {
+            loop {tokio::select! {
+                e=a.next()=>if matches!(e.unwrap(),Some(NetworkEvent::Fetched(89,_,_))){break},
+                e=b.next()=>{e.unwrap();},
+            }}
+        }).await.is_err());
+        drop(held);
         loop {tokio::select!{
-            e=a.next()=>if let Some(NetworkEvent::Fetched(88,volumes))=e.unwrap(){let volumes=volumes.unwrap();assert_eq!(volumes.len(),1);assert_eq!(volumes[0].root,volume.root);assert_eq!(volumes[0].entries,volume.entries);break},
+            e=a.next()=>if let Some(NetworkEvent::Fetched(89,volumes,_reservation))=e.unwrap(){assert_eq!(volumes.unwrap()[0].entries,volume.entries);break},
             e=b.next()=>{e.unwrap();},
         }}
         a.disconnect(&peer).await.unwrap();

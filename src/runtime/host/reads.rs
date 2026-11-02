@@ -127,9 +127,9 @@ impl Host {
                 }
                 Ok(Some(value))
             }
-            "/api/chain/info" => Ok(Some(
+            "/api/chain/info" => Ok(Some(self.finality.decorate_info(&["Nexus".into()],
                 json!({"chain":["Nexus"],"genesisHash":self.genesis,"height":self.chain.tree().height(tip).unwrap_or(0).to_string(),"tipCID":tip,"minRelayFee":self.mining.state().mempool().limits().min_relay_fee.to_string(),"acceptsSubmit":true}),
-            )),
+            ))),
             "/api/chain/genesis" => Ok(Some(json!({"genesisHash":self.genesis}))),
             "/api/chain/spec" | "/api/fees" => {
                 let Some(block) = block(tip)? else {
@@ -319,6 +319,9 @@ impl Host {
             .map(|m| m.tip_cid())
             .or_else(|| tree.executed_prefix())
         else {
+            if route == "/api/chain/info" {
+                return Ok(Some(self.finality.decorate_info(path, json!({"chain":path,"minRelayFee":self.mining.state().mempool().limits().min_relay_fee.to_string(),"acceptsSubmit":false}))));
+            }
             if route == "/status" {
                 let mut value = json!({"phase":"awaitingGenesis","chainPath":path,"nexusGenesisCID":self.genesis,"mempoolCount":0,"mempoolBytes":0});
                 if let Some(height) = tree.height(tree.canonical_tip()) {
@@ -338,9 +341,9 @@ impl Host {
             "/status" => Ok(Some(
                 json!({"phase":"active","chainPath":path,"nexusGenesisCID":self.genesis,"tipCID":tip,"height":tree.height(tip).unwrap_or(0).to_string(),"bestHeaderHeight":tree.height(tree.canonical_tip()).unwrap_or(0).to_string(),"mempoolCount":mining.map(|m|m.mempool().count()).unwrap_or(0),"mempoolBytes":mining.map(|m|m.mempool().byte_count()).unwrap_or(0)}),
             )),
-            "/api/chain/info" => Ok(Some(
+            "/api/chain/info" => Ok(Some(self.finality.decorate_info(path,
                 json!({"chain":path,"genesisHash":genesis,"height":tree.height(tip).unwrap_or(0).to_string(),"tipCID":tip,"minRelayFee":self.mining.state().mempool().limits().min_relay_fee.to_string(),"acceptsSubmit":mining.is_some()}),
-            )),
+            ))),
             "/api/mempool" => Ok(Some(
                 json!({"count":mining.map(|m|m.mempool().count()).unwrap_or(0),"transactions":mining.map(|m|m.mempool().items().into_iter().take(200).map(|i|i.cid).collect::<Vec<_>>()).unwrap_or_default()}),
             )),

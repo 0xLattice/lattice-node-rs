@@ -2,6 +2,10 @@
 //! after the host has consumed each notification. Outbound sends are bounded
 //! and retried only after Ivy reports the same authenticated session writable.
 mod read_endpoints;
+#[cfg(test)]
+mod transport_tests;
+mod websocket;
+use super::acquisition::{Priority, Queue, Reservation, ResourcePolicy, SESSION_BYTES};
 use super::handshake::{ChainHandshake, HELLO};
 use crate::{core::sync::PeerId, storage::NodeStorage};
 use ivy_core::core::{
@@ -22,6 +26,21 @@ use tokio::{
     task::JoinHandle,
 };
 
+/// Browser listener mode; programmatic hosts opt in, the daemon supplies its default.
+#[derive(Clone, Debug, Default)]
+pub enum WebSocketListener {
+    #[default]
+    Off,
+    IfAvailable(SocketAddr),
+    Required(SocketAddr),
+}
+#[derive(Clone, Debug, Default)]
+pub struct OverlayConfig {
+    pub websocket: WebSocketListener,
+    pub external_address: Option<std::net::IpAddr>,
+    pub resources: ResourcePolicy,
+}
+
 fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -41,7 +60,7 @@ pub enum NetworkEvent {
     Closed(PeerId),
     Message(PeerId, String, Vec<u8>),
     Sent(u64, bool),
-    Fetched(u64, Option<Vec<SerializedVolume>>),
+    Fetched(u64, Option<Vec<SerializedVolume>>, Option<Reservation>),
     FetchBusy(u64),
 }
 struct Session {
@@ -79,10 +98,15 @@ enum Pending {
     Fetch {
         tag: u64,
         root: String,
+        reservation: Reservation,
     },
     Retrieve {
         tag: u64,
         root: String,
+        reservation: Reservation,
+    },
+    CancelledAcquisition {
+        _reservation: Reservation,
     },
     Discover {
         path: Vec<String>,
@@ -91,7 +115,29 @@ enum Pending {
         path: Vec<String>,
     },
 }
+enum Acquisition {
+    Fetch {
+        tag: u64,
+        root: String,
+        bundle: bool,
+        peer: Option<PeerId>,
+    },
+    Retrieve {
+        tag: u64,
+        root: String,
+    },
+}
+impl Acquisition {
+    fn tag(&self) -> u64 {
+        match self {
+            Self::Fetch { tag, .. } | Self::Retrieve { tag, .. } => *tag,
+        }
+    }
+}
 pub struct Network {
+    acquisitions: Queue<Acquisition>,
+    websocket: Option<websocket::Running>,
+    pub websocket_address: Option<SocketAddr>,
     read_endpoints: read_endpoints::ReadEndpoints,
     commands: mpsc::Sender<Event>,
     outbound: VecDeque<Event>,
@@ -146,6 +192,27 @@ impl Network {
         tally: lattice_tally::Tally,
         bootstrap_peers: Vec<PeerEndpoint>,
     ) -> anyhow::Result<Self> {
+        Self::bind_with_overlay(
+            address,
+            key,
+            genesis,
+            storage,
+            tally,
+            bootstrap_peers,
+            OverlayConfig::default(),
+        )
+        .await
+    }
+    pub async fn bind_with_overlay(
+        address: SocketAddr,
+        key: ed25519_dalek::SigningKey,
+        genesis: String,
+        storage: Arc<NodeStorage>,
+        tally: lattice_tally::Tally,
+        bootstrap_peers: Vec<PeerEndpoint>,
+        overlay: OverlayConfig,
+    ) -> anyhow::Result<Self> {
+        overlay.resources.validate()?;
         let listener = TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
         let mut config = Config::new(key);
@@ -159,22 +226,49 @@ impl Network {
                     port: address.port(),
                 });
         }
+        let browser = match overlay.websocket {
+            WebSocketListener::Off => None,
+            WebSocketListener::Required(address) => Some(websocket::Listener::bind(address).await?),
+            WebSocketListener::IfAvailable(address) => {
+                match websocket::Listener::bind(address).await {
+                    Ok(listener) => Some(listener),
+                    Err(error) => {
+                        eprintln!(
+                            "lattice-node: not listening for WebSocket and STUN on {address}: {error}"
+                        );
+                        None
+                    }
+                }
+            }
+        };
+        let websocket_address = browser.as_ref().map(|listener| listener.address);
         let settings = CoreSettings {
             listen_port: Some(address.port()),
+            external_address: overlay.external_address.map(|host| {
+                ivy_core::stun::ObservedAddress {
+                    host: host.to_string(),
+                    port: address.port(),
+                }
+            }),
+            relay_enabled: browser.is_some(),
             bootstrap_peers,
+            max_concurrent_content_requests: overlay.resources.serving_max_concurrent,
+            max_in_flight_volume_bytes: overlay.resources.serving_max_in_flight_volume_bytes,
             ..CoreSettings::default()
         };
         settings.validate(&config).map_err(anyhow::Error::msg)?;
         let (commands, input) = mpsc::channel(128);
         let (output, effects) = mpsc::channel(128);
         let (shutdown, shutdown_requested) = oneshot::channel();
+        let (streams, supplied) = mpsc::channel(16);
+        let websocket = browser.map(|listener| listener.start(streams));
         let task = tokio::spawn(ivy::node::run_with_shutdown(
             listener,
             config,
             settings,
             input,
             output,
-            None,
+            Some(supplied),
             ivy_tally::TallyLedger(tally.clone()),
             async move {
                 let _ = shutdown_requested.await;
@@ -182,6 +276,9 @@ impl Network {
         ));
         commands.send(Event::SetContentSource(true)).await?;
         Ok(Self {
+            acquisitions: Queue::new(overlay.resources.max_acquisition_bytes),
+            websocket,
+            websocket_address,
             read_endpoints: Default::default(),
             commands,
             outbound: VecDeque::new(),
@@ -401,67 +498,124 @@ impl Network {
         bundle: bool,
         peer: Option<&PeerId>,
     ) -> anyhow::Result<()> {
-        if self
-            .pending
-            .values()
-            .filter(|p| matches!(p, Pending::Fetch { .. } | Pending::Retrieve { .. }))
-            .count()
-            >= 64
-        {
-            self.events.push_back(NetworkEvent::Fetched(tag, None));
-            return Ok(());
-        }
-        let peers = if let Some(peer) = peer {
-            self.session(peer)
-                .filter(|s| s.ready)
-                .map(|s| vec![s.peer.clone()])
-                .unwrap_or_default()
-        } else {
-            self.sessions
-                .values()
-                .filter(|s| s.ready)
-                .map(|s| s.peer.clone())
-                .collect()
-        };
-        if peers.is_empty() {
-            self.events.push_back(NetworkEvent::Fetched(tag, None));
-            return Ok(());
-        }
-        self.request(
-            Request::FetchFromSessions {
-                root_cid: root.clone(),
+        self.acquisitions.push(
+            SESSION_BYTES,
+            Priority::OwnWork,
+            Acquisition::Fetch {
+                tag,
+                root,
                 bundle,
-                peers,
-                maximum_archive_bytes: 16 * 1024 * 1024,
-                maximum_entries: u16::MAX,
+                peer: peer.cloned(),
             },
-            Some(Pending::Fetch { tag, root }),
-        )
-        .await
+        );
+        Ok(())
+    }
+    pub async fn fetch_body(
+        &mut self,
+        tag: u64,
+        root: String,
+        depth: usize,
+        peer: Option<&PeerId>,
+    ) -> anyhow::Result<()> {
+        self.acquisitions.push(
+            SESSION_BYTES,
+            Priority::Body {
+                cid: root.clone(),
+                depth,
+            },
+            Acquisition::Fetch {
+                tag,
+                root,
+                bundle: true,
+                peer: peer.cloned(),
+            },
+        );
+        Ok(())
+    }
+    pub fn prioritize_acquisitions(&mut self, next: BTreeSet<String>) {
+        self.acquisitions.prioritize(next);
     }
     pub fn requeue_unavailable(&mut self, tag: u64) {
-        self.events.push_back(NetworkEvent::Fetched(tag, None));
+        self.events
+            .push_back(NetworkEvent::Fetched(tag, None, None));
     }
     pub async fn retrieve(&mut self, tag: u64, root: String) -> anyhow::Result<()> {
-        if self
-            .pending
-            .values()
-            .filter(|p| matches!(p, Pending::Fetch { .. } | Pending::Retrieve { .. }))
-            .count()
-            >= 64
-        {
-            self.events.push_back(NetworkEvent::FetchBusy(tag));
-            return Ok(());
+        // Operator reads that are already local never wait behind network work.
+        if let Some(volume) = self.storage.serving_volume(&root)? {
+            self.events
+                .push_back(NetworkEvent::Fetched(tag, Some(vec![volume]), None));
+        } else {
+            self.acquisitions.push(
+                SESSION_BYTES,
+                Priority::OwnWork,
+                Acquisition::Retrieve { tag, root },
+            );
         }
-        self.request(
-            Request::RetrieveVolume {
-                root_cid: root.clone(),
-                maximum_archive_bytes: 64 * 1024 * 1024,
-                maximum_entries: u16::MAX,
-            },
-            Some(Pending::Retrieve { tag, root }),
-        )
-        .await
+        Ok(())
+    }
+    async fn dispatch_acquisitions(&mut self) -> anyhow::Result<()> {
+        while self.outbound.len() < 4096 {
+            let Some((request, reservation)) = self.acquisitions.pop() else {
+                break;
+            };
+            match request {
+                Acquisition::Retrieve { tag, root } => {
+                    self.request(
+                        Request::RetrieveVolume {
+                            root_cid: root.clone(),
+                            maximum_archive_bytes: SESSION_BYTES,
+                            maximum_entries: u16::MAX,
+                        },
+                        Some(Pending::Retrieve {
+                            tag,
+                            root,
+                            reservation,
+                        }),
+                    )
+                    .await?;
+                }
+                Acquisition::Fetch {
+                    tag,
+                    root,
+                    bundle,
+                    peer,
+                } => {
+                    let peers = if let Some(peer) = peer {
+                        self.session(&peer)
+                            .filter(|s| s.ready)
+                            .map(|s| vec![s.peer.clone()])
+                            .unwrap_or_default()
+                    } else {
+                        self.sessions
+                            .values()
+                            .filter(|s| s.ready)
+                            .map(|s| s.peer.clone())
+                            .collect()
+                    };
+                    if peers.is_empty() {
+                        self.events
+                            .push_back(NetworkEvent::Fetched(tag, None, None));
+                        continue;
+                    }
+                    self.request(
+                        Request::FetchFromSessions {
+                            root_cid: root.clone(),
+                            bundle,
+                            peers,
+                            maximum_archive_bytes: SESSION_BYTES,
+                            maximum_entries: u16::MAX,
+                        },
+                        Some(Pending::Fetch {
+                            tag,
+                            root,
+                            reservation,
+                        }),
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
     }
     pub fn searching_hosted(&self, path: &[String]) -> bool {
         self.pending
@@ -502,6 +656,9 @@ impl Network {
         self.emit(Event::StopProviding { root_cid: root })
     }
     pub async fn cancel_fetch(&mut self, tag: u64) -> anyhow::Result<()> {
+        self.acquisitions.retain(|request| request.tag() != tag);
+        self.events
+            .retain(|event| !matches!(event, NetworkEvent::Fetched(id,_,_) if *id==tag));
         let ids: Vec<_> = self
             .pending
             .iter()
@@ -511,7 +668,18 @@ impl Network {
             })
             .collect();
         for id in ids {
-            self.pending.remove(&id);
+            let reservation = match self.pending.remove(&id).unwrap() {
+                Pending::Fetch { reservation, .. } | Pending::Retrieve { reservation, .. } => {
+                    reservation
+                }
+                _ => unreachable!(),
+            };
+            self.pending.insert(
+                id,
+                Pending::CancelledAcquisition {
+                    _reservation: reservation,
+                },
+            );
             self.emit(Event::Cancel(id))?;
         }
         Ok(())
@@ -549,6 +717,7 @@ impl Network {
     }
     pub async fn next(&mut self) -> anyhow::Result<Option<NetworkEvent>> {
         loop {
+            self.dispatch_acquisitions().await?;
             while !self.outbound.is_empty() {
                 match self.commands.try_reserve() {
                     Ok(permit) => permit.send(self.outbound.pop_front().unwrap()),
@@ -576,13 +745,11 @@ impl Network {
             // Commands and notifications are both bounded. Keep draining
             // effects while waiting for command capacity to avoid a cycle.
             // Pop only after reservation: cancellation leaves commands queued.
-            let incoming = if self.outbound.is_empty() {
-                self.effects.recv().await
-            } else {
-                tokio::select! {
-                    permit=self.commands.reserve()=>{permit?.send(self.outbound.pop_front().unwrap());continue},
-                    effect=self.effects.recv()=>effect,
-                }
+            let wake = self.acquisitions.wakeup();
+            let incoming = tokio::select! {
+                _=wake.notified()=>continue,
+                permit=self.commands.reserve(), if !self.outbound.is_empty()=>{permit?.send(self.outbound.pop_front().unwrap());continue},
+                effect=self.effects.recv()=>effect,
             };
             let Some(effect) = incoming else {
                 return Ok(None);
@@ -688,6 +855,7 @@ impl Network {
                 Effect::Completed(id, result) => {
                     if let Some(pending) = self.pending.remove(&id) {
                         match pending {
+                            Pending::CancelledAcquisition { .. } => {}
                             Pending::ReadProviders { lookup } => {
                                 self.read_providers(lookup, result).await?
                             }
@@ -802,7 +970,16 @@ impl Network {
                                     }
                                 }
                             }
-                            Pending::Fetch { tag, root } | Pending::Retrieve { tag, root } => {
+                            Pending::Fetch {
+                                tag,
+                                root,
+                                reservation,
+                            }
+                            | Pending::Retrieve {
+                                tag,
+                                root,
+                                reservation,
+                            } => {
                                 if matches!(&result, RequestResult::Volume(response) if response.failure == Some(ivy_core::VolumeReceiveError::LocalCapacityUnavailable))
                                 {
                                     self.events.push_back(NetworkEvent::FetchBusy(tag));
@@ -830,7 +1007,11 @@ impl Network {
                                 } else {
                                     None
                                 };
-                                self.events.push_back(NetworkEvent::Fetched(tag, volumes));
+                                self.events.push_back(NetworkEvent::Fetched(
+                                    tag,
+                                    volumes,
+                                    Some(reservation),
+                                ));
                             }
                         }
                     }
@@ -872,6 +1053,9 @@ impl Network {
         }
     }
     pub async fn stop(&mut self) {
+        if let Some(mut websocket) = self.websocket.take() {
+            websocket.stop().await;
+        }
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
             let _ = (&mut self.task).await;
@@ -889,6 +1073,108 @@ impl Drop for Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn acquisition_budget_survives_cancel_and_completed_host_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(NodeStorage::open(dir.path(), "root", "test").unwrap());
+        let mut network = Network::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+            "root".into(),
+            storage,
+        )
+        .await
+        .unwrap();
+        network.stop().await;
+        network.acquisitions = Queue::new(SESSION_BYTES);
+        let (commands, mut input) = mpsc::channel(32);
+        let (output, effects) = mpsc::channel(32);
+        network.commands = commands;
+        network.effects = effects;
+        let old = network.next;
+        network.retrieve(1, "remote".into()).await.unwrap();
+        network.dispatch_acquisitions().await.unwrap();
+        network.cancel_fetch(1).await.unwrap();
+        network.retrieve(2, "remote".into()).await.unwrap();
+        network
+            .retrieve(99, "cancel-before-grant".into())
+            .await
+            .unwrap();
+        network.cancel_fetch(99).await.unwrap();
+        network.dispatch_acquisitions().await.unwrap();
+        assert_eq!(network.acquisitions.used(), SESSION_BYTES);
+        assert_eq!(network.acquisitions.waiting(), 1);
+        let bytes = b"local-only budget bypass".to_vec();
+        let cid = lattice_cashew::cid_for_bytes(0x55, &bytes);
+        let volume = SerializedVolume::new(cid.clone(), BTreeMap::from([(cid.clone(), bytes)]));
+        network
+            .storage
+            .cache_volumes("local-test", &[volume])
+            .unwrap();
+        network.retrieve(100, cid).await.unwrap();
+        assert!(matches!(
+            network.events.pop_front(),
+            Some(NetworkEvent::Fetched(100, Some(_), None))
+        ));
+        assert_eq!(network.acquisitions.used(), SESSION_BYTES);
+        assert!(matches!(
+            network.pending.get(&old),
+            Some(Pending::CancelledAcquisition { .. })
+        ));
+        let replacement = network.next;
+        let driver = tokio::spawn(async move {
+            assert!(matches!(input.recv().await, Some(Event::Request(id, _)) if id == old));
+            assert!(matches!(input.recv().await, Some(Event::Cancel(id)) if id == old));
+            assert!(
+                input.try_recv().is_err(),
+                "replacement waits for cancellation acknowledgment"
+            );
+            // An already completed request may race cancellation; either terminal
+            // result retires the tombstone without publishing obsolete content.
+            output
+                .send(Effect::Completed(old, RequestResult::Failed))
+                .await
+                .unwrap();
+            assert!(matches!(input.recv().await, Some(Event::Request(id, _)) if id == replacement));
+            output
+                .send(Effect::Completed(replacement, RequestResult::Failed))
+                .await
+                .unwrap();
+            input.recv().await;
+        });
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(2), network.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &completed,
+            Some(NetworkEvent::Fetched(2, None, Some(_)))
+        ));
+        assert_eq!(
+            network.acquisitions.used(),
+            SESSION_BYTES,
+            "completed response stays reserved through consumption"
+        );
+        network.retrieve(3, "remote".into()).await.unwrap();
+        network.dispatch_acquisitions().await.unwrap();
+        assert_eq!(network.acquisitions.waiting(), 1);
+        let wake = network.acquisitions.wakeup();
+        // Consume previous notifications before proving the handoff drop wakes.
+        while tokio::time::timeout(std::time::Duration::from_millis(1), wake.notified())
+            .await
+            .is_ok()
+        {}
+        drop(completed);
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .unwrap();
+        assert_eq!(network.acquisitions.used(), 0);
+        network.dispatch_acquisitions().await.unwrap();
+        assert_eq!(network.acquisitions.waiting(), 0);
+        assert_eq!(network.acquisitions.used(), SESSION_BYTES);
+        driver.abort();
+        let _ = driver.await;
+    }
     #[tokio::test]
     async fn cancelled_retrieval_precedes_replacement_and_late_completion_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
@@ -908,9 +1194,11 @@ mod tests {
         network.effects = effects;
         let old = network.next;
         network.retrieve(41, "root".into()).await.unwrap();
+        network.dispatch_acquisitions().await.unwrap();
         network.cancel_fetch(41).await.unwrap();
         let replacement = network.next;
         network.retrieve(42, "root".into()).await.unwrap();
+        network.dispatch_acquisitions().await.unwrap();
         let driver = tokio::spawn(async move {
             assert!(
                 matches!(input.recv().await,Some(Event::Request(id,Request::RetrieveVolume{..})) if id==old)
@@ -933,22 +1221,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(result, Some(NetworkEvent::Fetched(42, None))));
+        assert!(matches!(result, Some(NetworkEvent::Fetched(42, None, _))));
         assert!(network.pending.is_empty());
-        for id in 0..64 {
-            network.pending.insert(
-                id,
-                Pending::Fetch {
-                    tag: id,
-                    root: "root".into(),
-                },
-            );
-        }
-        network.retrieve(100, "root".into()).await.unwrap();
-        assert!(matches!(
-            network.next().await.unwrap(),
-            Some(NetworkEvent::FetchBusy(100))
-        ));
         driver.abort();
         let _ = driver.await;
     }
@@ -1081,9 +1355,13 @@ mod tests {
             Some(Event::Delivered(7))
         ));
         output.send(Effect::CancelJob(1)).await.unwrap();
+        let mut budget = Queue::new(SESSION_BYTES);
+        budget.push(SESSION_BYTES, Priority::OwnWork, ());
+        let (_, reservation) = budget.pop().unwrap();
         network.pending.insert(
             99,
             Pending::Fetch {
+                reservation,
                 tag: 99,
                 root: "root".into(),
             },
@@ -1104,7 +1382,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(event, Some(NetworkEvent::Fetched(99, None))));
+        assert!(matches!(event, Some(NetworkEvent::Fetched(99, None, _))));
         assert!(network.outbound.is_empty());
         driver.abort();
     }

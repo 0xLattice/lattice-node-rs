@@ -45,6 +45,23 @@ pub fn router_with_fetches(
     submit: bool,
     fetches: usize,
 ) -> anyhow::Result<Router> {
+    router_with_fetch_budget(
+        backend,
+        limits,
+        submit,
+        fetches,
+        super::acquisition::ResourcePolicy::default().serving_max_in_flight_volume_bytes,
+    )
+}
+/// The daemon supplies its configured Ivy serving budget here, so public
+/// retrievals retain the same half-budget headroom as Swift PublicVolumeFetches.
+pub fn router_with_fetch_budget(
+    backend: Arc<dyn RpcBackend>,
+    limits: RateLimits,
+    submit: bool,
+    fetches: usize,
+    in_flight_volume_bytes: usize,
+) -> anyhow::Result<Router> {
     let limiter = RateLimiter::new(limits, 0.).map_err(anyhow::Error::msg)?;
     Ok(Router::new()
         .fallback(any(dispatch))
@@ -52,7 +69,7 @@ pub fn router_with_fetches(
             submit,
             fetches: crate::runtime::public_fetch::PublicVolumeFetches::new(
                 fetches,
-                128 * 1024 * 1024,
+                in_flight_volume_bytes,
                 Arc::new(BackendFetcher(backend.clone())),
             ),
             backend,

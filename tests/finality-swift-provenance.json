@@ -1,0 +1,9 @@
+{
+  "swiftRevision": "3df9e0a786c7b103a3da88d1c3881efc81706255",
+  "observations": 1200,
+  "sourceSha256": {
+    "Sources/LatticeNodeCore/Chain/ChainCore.swift": "b76947a1f15b61adc5d0c617eb538a00a727836f36b6041e071ecba2cec4c38b",
+    "Sources/LatticeNodeCore/Chain/ChainSelection.swift": "7fa4a12a046c047ed75957a55e16780b0534ace2ce3a16a1eb0dfca67c605f32"
+  },
+  "scope": "Original FinalityWindows and pastFinality(height:) methods; tree height supplied, daemon parser and scheduler excluded"
+}

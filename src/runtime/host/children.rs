@@ -249,7 +249,9 @@ impl Host {
                         self.fetches
                             .insert(id, Fetch::ChildBody(path.clone(), cid.clone()));
                         let peer = self.network.peers_hosting(&path).into_iter().next();
-                        self.network.fetch(id, cid, true, peer.as_ref()).await?;
+                        self.network
+                            .fetch_body(id, cid, path.len() - 1, peer.as_ref())
+                            .await?;
                     }
                 }
                 BodyEffect::Cancel(cid) => {
@@ -350,6 +352,9 @@ impl Host {
                 64,
             ) {
                 failure = Some(error);
+            }
+            if let Some(level) = self.levels.get_mut(&path) {
+                level.set_finality_window(self.finality.window(&path));
             }
         }
         self.child_settings = configuration

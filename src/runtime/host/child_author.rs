@@ -36,9 +36,7 @@ impl Host {
         route: &str,
         body: &Value,
     ) -> anyhow::Result<Option<(u16, Value)>> {
-        let result = if route == "/child-blocks/build" {
-            Some(self.build_child(body))
-        } else if route == "/child-blocks" {
+        let result = if route == "/child-blocks" {
             Some(self.push_child(body))
         } else if let Some(query) = route.strip_prefix("/child-blocks/commitment?") {
             let path = form_urlencoded::parse(query.as_bytes())
@@ -93,61 +91,61 @@ impl Host {
         };
         Ok(result)
     }
-    fn build_child(&mut self, body: &Value) -> anyhow::Result<Value> {
-        let request: Build = serde_json::from_value(body.clone())?;
-        let path = request.chain_path;
-        anyhow::ensure!(path_ok(&path), "invalidChainPath");
-        if let Some(recipient) = &request.recipient {
-            anyhow::ensure!(
-                lattice_primitives::standard_cid(recipient),
-                "invalidRecipientPlan"
-            );
-        }
-        anyhow::ensure!(self.levels.get(&path).is_some(), "unknownChain");
-        let state = self.mining.state();
-        let tip = state.tip_cid().to_owned();
-        let mut plan = TemplateRequest::default();
-        if let Some(recipient) = request.recipient {
-            plan.child_recipients.insert(path.clone(), recipient);
-        }
-        let job = TemplateJob {
-            id: 0,
-            tip_cid: tip.clone(),
-            tip_epoch: state.tip_epoch(),
-            pool_version: state.mempool().version(),
-            transactions: state
-                .mempool()
-                .items()
-                .into_iter()
-                .map(|i| i.transaction)
-                .collect(),
-            request: plan,
-        };
-        let anchor = self.chain.tree().difficulty_anchor(&tip).map(|a| {
-            lattice_validation::DifficultyAnchor {
-                block_height: a.block_height,
-                timestamp: a.timestamp,
-                target: UInt256(a.target),
+    pub(super) fn request_child_build(
+        &mut self,
+        body: &Value,
+        reply: oneshot::Sender<(u16, Value)>,
+    ) -> anyhow::Result<()> {
+        let parsed = (|| -> anyhow::Result<(Vec<String>, TemplateRequest)> {
+            let request: Build = serde_json::from_value(body.clone())?;
+            let path = request.chain_path;
+            anyhow::ensure!(path_ok(&path), "invalidChainPath");
+            if let Some(recipient) = &request.recipient {
+                anyhow::ensure!(
+                    lattice_primitives::standard_cid(recipient),
+                    "invalidRecipientPlan"
+                );
             }
-        });
-        let contexts = self.child_templates(&tip)?;
-        let output = super::super::merged_template::build_merged_template(
-            &job,
-            self.storage.as_ref(),
-            now(),
-            anchor,
-            &contexts,
-        )?;
-        self.child_policy_refused(&output.refused)?;
-        self.event(MiningEvent::PolicyRefused {
-            tip_cid: tip,
-            cids: output
-                .refused
-                .get(&vec!["Nexus".into()])
-                .cloned()
-                .unwrap_or_default(),
-        })?;
-        let mut block = output.build.block;
+            anyhow::ensure!(self.levels.get(&path).is_some(), "unknownChain");
+            let mut plan = TemplateRequest::default();
+            if let Some(recipient) = request.recipient {
+                plan.child_recipients.insert(path.clone(), recipient);
+            }
+            Ok((path, plan))
+        })();
+        let (path, plan) = match parsed {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = reply.send(super::error(error));
+                return Ok(());
+            }
+        };
+        if self.replies.len() >= 128 || !self.mining.state().template_request_available() {
+            let _ = reply.send((503, json!({"error":{"message":"busy"}})));
+            return Ok(());
+        }
+        let id = self.id()?;
+        self.child_build_replies.insert(id, path);
+        self.replies.insert(id, reply);
+        self.event(MiningEvent::TemplateRequested(id, Box::new(plan)))
+    }
+    pub(super) fn complete_child_build(
+        &mut self,
+        id: u64,
+        path: Vec<String>,
+        block: Block,
+    ) -> anyhow::Result<()> {
+        let result = self.store_child_candidate(path, block);
+        if let Some(response) = author_response(Some(result))? {
+            self.reply(id, response);
+        }
+        Ok(())
+    }
+    fn store_child_candidate(
+        &mut self,
+        path: Vec<String>,
+        mut block: Block,
+    ) -> anyhow::Result<Value> {
         for directory in path.iter().skip(1) {
             block = block
                 .children
@@ -189,6 +187,8 @@ impl Host {
                     &cid,
                     &path,
                 )?;
+                self.storage
+                    .retain_prepared_state(&block.post_state.raw_cid, &cid, &path)?;
                 if let Some(children) = block.children.node.as_ref() {
                     for (d, h) in children.iter() {
                         if let Some(b) = h.0.node.as_deref() {

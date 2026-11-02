@@ -14,6 +14,7 @@ pub(super) enum Completion {
     Root(RootPreflightCompletion),
     Child(Vec<String>, ChildPreflightCompletion),
     Template(Box<templates::TemplateCompletion>),
+    Connection(connections::ConnectionCompletion),
 }
 const MAX_WORKERS: usize = 4;
 pub(super) struct Preflights {
@@ -45,6 +46,9 @@ impl Preflights {
     }
     pub(super) fn start_template(&mut self, task: templates::TemplateTask) {
         self.spawn(move || Ok(Completion::Template(Box::new(task.run()))));
+    }
+    pub(super) fn start_connection(&mut self, task: connections::ConnectionTask) {
+        self.spawn(move || task.run().map(Completion::Connection));
     }
     pub(super) fn spawn(
         &mut self,

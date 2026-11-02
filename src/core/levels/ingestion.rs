@@ -38,7 +38,16 @@ impl ChildChainCore {
             }
         }
         let log = next.log.clone();
-        let turn = next.finish_headers_response(peer, work, &received, now, |e| !log.contains(e));
+        let mut turn = next.finish_headers_response(peer, work, &received, now, |e| {
+            !log.contains(e) && !self.finality_done(e)
+        });
+        for peer in next.peers.keys().cloned().collect::<Vec<_>>() {
+            next.advance_cursor(
+                &peer,
+                |e| log.contains(e) || self.finality_done(e),
+                &mut turn,
+            );
+        }
         self.persist_cursors(&turn.cursors)?;
         self.sync = next;
         let mut effects = self.finish(turn, now);
@@ -46,9 +55,7 @@ impl ChildChainCore {
         Ok(effects)
     }
     fn past_finality(&self, height: u64) -> bool {
-        self.header_config
-            .finality
-            .is_some_and(|w| self.tree.highest_block_height().saturating_sub(height) > w)
+        super::super::finality::past(&self.tree, height, self.header_config.finality)
     }
     /// Header receipt only queues bounded proof checks. No peer claim advances
     /// the weigh log before the proof result crosses actual admission/storage.
@@ -74,7 +81,14 @@ impl ChildChainCore {
         now: i64,
     ) -> Result<bool, StoreError> {
         let cid = content_id(&entry.block)?;
-        if self.past_finality(entry.block.height) {
+        if self.past_finality(entry.block.height)
+            || entry
+                .block
+                .parent
+                .as_ref()
+                .is_some_and(|p| self.declined.contains(&p.0.raw_cid))
+        {
+            self.declined.insert(cid);
             return Ok(false);
         }
         if self.tree.contains(&cid) {
@@ -185,7 +199,9 @@ impl ChildChainCore {
         let Some(checked) = checked else {
             return Ok(ChainEffects::default());
         };
-        self.apply_checked_proof(checked, now)
+        let mut effects = self.apply_checked_proof(checked, now)?;
+        append(&mut effects, self.advance_finality_cursors(now)?);
+        Ok(effects)
     }
     pub(super) fn apply_checked_proof(
         &mut self,
@@ -296,6 +312,7 @@ impl ChildChainCore {
                     continue;
                 }
                 if self.past_finality(header.block.height) {
+                    self.declined.insert(cid.clone());
                     self.pending.remove(&cid);
                     changed = true;
                     continue;
@@ -417,6 +434,7 @@ impl ChildChainCore {
         }
         self.pending.evict(self.header_config.pending_bytes);
         self.pending.compact();
+        append(&mut effects, self.advance_finality_cursors(now)?);
         Ok(effects)
     }
     pub fn child_index_fetched(

@@ -24,24 +24,33 @@ pub(super) struct TemplateTask {
     fence: Fence,
     anchor: Option<lattice_validation::DifficultyAnchor>,
     contexts: BTreeMap<Vec<String>, ChildTemplateContext>,
-    snapshot: lattice_volume_broker::DiskReadSnapshot,
-    _storage: Arc<NodeStorage>,
+    content: crate::storage::ConnectionContent,
 }
 pub(super) struct TemplateCompletion {
     job: TemplateJob,
     fence: Fence,
     output: Result<MergedTemplateBuildOutput, TemplateBuildError>,
+    content: Arc<crate::storage::ConnectionContent>,
+    preserved: Result<(), crate::storage::StoreError>,
 }
 impl TemplateTask {
     pub(super) fn run(self) -> TemplateCompletion {
         let output = super::super::merged_template::build_merged_template(
             &self.job,
-            &SnapshotSource(&self.snapshot),
+            &SnapshotSource(self.content.snapshot()),
             now(),
             self.anchor,
             &self.contexts,
         );
+        let preserved = match &output {
+            Ok(output) => Volume::new(output.build.block.clone())
+                .map_err(crate::storage::StoreError::from)
+                .and_then(|header| self.content.preserve(&header)),
+            Err(_) => Ok(()),
+        };
         TemplateCompletion {
+            content: Arc::new(self.content),
+            preserved,
             job: self.job,
             fence: self.fence,
             output,
@@ -106,16 +115,22 @@ impl Host {
                 target: UInt256(a.target),
             }
         });
+        let content = crate::storage::ConnectionContent::new(
+            self.storage.preflight_snapshot()?,
+            self.storage.clone(),
+            &format!("template-{}", job.id),
+            vec![],
+        );
         Ok(Some(TemplateTask {
+            content,
             job,
             fence,
             contexts,
             anchor,
-            snapshot: self.storage.preflight_snapshot()?,
-            _storage: self.storage.clone(),
         }))
     }
     pub(super) fn complete_template(&mut self, done: TemplateCompletion) -> anyhow::Result<()> {
+        done.preserved?;
         self.cancel_abandoned_templates();
         if !self.mining.state().template_job_pending(&done.job) {
             return Ok(());
@@ -136,6 +151,8 @@ impl Host {
                         .cloned()
                         .unwrap_or_default(),
                 })?;
+                self.template_content
+                    .insert(output.build.work_id.clone(), done.content);
                 self.event(MiningEvent::TemplateBuilt(
                     Box::new(done.job),
                     Some(Box::new(output.build)),
@@ -151,11 +168,22 @@ impl Host {
             .filter_map(|(id, reply)| reply.is_closed().then_some(*id))
             .collect();
         self.mining.cancel_template_requests(&closed);
+        let time = now();
+        self.template_content.retain(|id, _| {
+            self.mining
+                .state()
+                .templates()
+                .template(id)
+                .is_some_and(|work| time < work.expires_at)
+        });
         // Fetch cancellation has its own network/lease cleanup; do not consume
         // those IDs before it runs at the top of the actor iteration.
         for id in closed {
             if !self.fetches.contains_key(&id) {
                 self.replies.remove(&id);
+                self.child_build_replies.remove(&id);
+                // A submitted nonce has already queued Mined/WorkRefused.
+                // Its lease belongs to that effect, independently of HTTP cancellation.
             }
         }
     }
@@ -165,7 +193,7 @@ impl Host {
 mod tests {
     use super::*;
     use tokio::time::{Duration, timeout};
-    async fn inspect<T: Send + 'static>(
+    pub(super) async fn inspect<T: Send + 'static>(
         handle: &HostHandle,
         inspect: impl FnOnce(&mut Host) -> T + Send + 'static,
     ) -> T {
@@ -182,13 +210,22 @@ mod tests {
         timeout(Duration::from_secs(5), rx).await.unwrap().unwrap()
     }
     async fn fixture() -> (tempfile::TempDir, RunningHost) {
+        fixture_row(0).await
+    }
+    async fn fixture_row(index: usize) -> (tempfile::TempDir, RunningHost) {
+        fixture_row_with_retention(index, crate::storage::RetentionPolicy::default()).await
+    }
+    pub(super) async fn fixture_row_with_retention(
+        index: usize,
+        retention: crate::storage::RetentionPolicy,
+    ) -> (tempfile::TempDir, RunningHost) {
         let rows: Value = serde_json::from_str(include_str!(
             "../../../../lattice-rs/crates/lattice-validation/tests/genesis-swift.json"
         ))
         .unwrap();
         let entries: BTreeMap<String, Vec<u8>> =
-            serde_json::from_value(rows[0]["entries"].clone()).unwrap();
-        let cid = rows[0]["cid"].as_str().unwrap().to_owned();
+            serde_json::from_value(rows[index]["entries"].clone()).unwrap();
+        let cid = rows[index]["cid"].as_str().unwrap().to_owned();
         let verified = lattice_validation::validate_root_genesis(
             &Volume(Header::from_cid(&cid).unwrap()),
             &entries,
@@ -196,16 +233,22 @@ mod tests {
         )
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let host = start(HostConfig {
-            directory: dir.path().into(),
-            genesis_cid: cid,
-            bootstrap_volumes: lattice_cashew::volume::serialize_recursive(verified.header(), &())
+        let host = start_with_retention(
+            HostConfig {
+                directory: dir.path().into(),
+                genesis_cid: cid,
+                bootstrap_volumes: lattice_cashew::volume::serialize_recursive(
+                    verified.header(),
+                    &(),
+                )
                 .unwrap(),
-            signing_key: ed25519_dalek::SigningKey::from_bytes(&[73; 32]),
-            listen: "127.0.0.1:0".parse().unwrap(),
-            min_relay_fee: 1,
-            seeds: vec![],
-        })
+                signing_key: ed25519_dalek::SigningKey::from_bytes(&[73; 32]),
+                listen: "127.0.0.1:0".parse().unwrap(),
+                min_relay_fee: 1,
+                seeds: vec![],
+            },
+            retention,
+        )
         .await
         .unwrap();
         (dir, host)
@@ -425,4 +468,126 @@ mod tests {
         running.handle.shutdown().await;
         running.task.await.unwrap().unwrap();
     }
+    async fn host_author_child(dir: &std::path::Path, handle: &HostHandle) {
+        let spec = dir.join("author-spec.json");
+        std::fs::write(
+            &spec,
+            serde_json::to_vec(&json!({
+                "maxNumberOfTransactionsPerBlock":1000,"maxStateGrowth":100000,
+                "maxBlockSize":1000000,"premine":1,"targetBlockTime":1000,
+                "initialReward":10,"halvingInterval":1000,"halfLife":120,"wasmPolicies":[]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let owner = inspect(handle, |host| host.genesis.clone()).await;
+        let (code, body) = handle
+            .request(
+                "POST /hosted-chains",
+                json!({
+                    "hostChain":[format!("Nexus/Alpha={}", spec.display())],
+                    "premineTo":[format!("Nexus/Alpha={owner}")]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(code, 200, "{body}");
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_author_uses_fenced_worker_and_actor_stays_responsive() {
+        let (dir, running) = fixture_row(9).await;
+        let handle = &running.handle;
+        host_author_child(dir.path(), handle).await;
+        let (release, gate) = std::sync::mpsc::channel();
+        let (started, began) = oneshot::channel();
+        let reply = inspect(handle, move |host| {
+            let (tx, rx) = oneshot::channel();
+            host.api("/child-blocks/build".into(), json!({"chainPath":["Nexus","Alpha"]}), tx).unwrap();
+            assert_eq!(host.child_build_replies.len(), 1);
+            let index = host.queue.iter().position(|work| matches!(work, Work::Mining(e) if matches!(e.as_ref(), MiningEffect::BuildTemplate(_)))).unwrap();
+            let Work::Mining(effect) = host.queue.remove(index).unwrap() else { unreachable!() };
+            let MiningEffect::BuildTemplate(job) = *effect else { unreachable!() };
+            let task = host.prepare_template(job).unwrap().unwrap();
+            host.preflights.spawn(move || {
+                let done = task.run();
+                assert!(done.output.as_ref().unwrap().build.block.children.node.as_ref().unwrap().get("Alpha").is_some());
+                let _ = started.send(());
+                gate.recv().unwrap();
+                Ok(preflight::Completion::Template(Box::new(done)))
+            });
+            rx
+        }).await;
+        timeout(Duration::from_secs(5), began)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(2), handle.request("/status", json!({})))
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            200
+        );
+        assert_eq!(
+            handle
+                .request("POST /hosted-chains", json!({"hostChain":[]}))
+                .await
+                .unwrap()
+                .0,
+            200
+        );
+        release.send(()).unwrap();
+        let (code, body) = timeout(Duration::from_secs(5), reply)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 400, "{body}");
+        assert_eq!(body["error"]["message"], "noChildCandidate");
+        inspect(handle, |host| assert!(host.child_build_replies.is_empty())).await;
+        handle.shutdown().await;
+        running.task.await.unwrap().unwrap();
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_author_worker_builds_candidate_and_abandoned_request_is_cancelled() {
+        let (dir, running) = fixture_row(9).await;
+        let handle = &running.handle;
+        host_author_child(dir.path(), handle).await;
+        inspect(handle, |host| {
+            let (tx, rx) = oneshot::channel();
+            host.api(
+                "/child-blocks/build".into(),
+                json!({"chainPath":["Nexus","Alpha"]}),
+                tx,
+            )
+            .unwrap();
+            assert_eq!(host.mining.state().waiting_template_requests(), 1);
+            drop(rx);
+            host.cancel_abandoned_templates();
+            assert_eq!(host.mining.state().waiting_template_requests(), 0);
+            assert!(host.child_build_replies.is_empty());
+        })
+        .await;
+        let (code, body) = handle
+            .request(
+                "/child-blocks/build",
+                json!({"chainPath":["Nexus","Alpha"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(code, 200, "{body}");
+        assert!(body["submit"]["block"].as_str().is_some(), "{body}");
+        assert!(body["submit"]["children"].as_str().is_some(), "{body}");
+        inspect(handle, |host| {
+            assert!(host.child_build_replies.is_empty());
+            assert_eq!(host.mining.state().waiting_template_requests(), 0);
+        })
+        .await;
+        handle.shutdown().await;
+        running.task.await.unwrap().unwrap();
+    }
 }
+
+#[cfg(test)]
+#[path = "templates/lifetime_tests.rs"]
+mod lifetime_tests;

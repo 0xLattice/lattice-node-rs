@@ -5,7 +5,10 @@ use ivy_core::PeerEndpoint;
 use lattice_cashew::SerializedVolume;
 use lattice_node::runtime::{
     api::{self, Cookie, RpcBackend, RpcFuture},
-    host::{DiscoveryConfig, HostConfig, HostHandle, start_with_hosted_configuration},
+    host::{
+        DiscoveryConfig, FinalityWindows, HostConfig, HostHandle,
+        start_with_hosted_overlay_configuration,
+    },
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -21,10 +24,20 @@ use std::{
 struct Config {
     directory: PathBuf,
     #[serde(default)]
+    serving_max_concurrent: Option<usize>,
+    #[serde(default)]
+    serving_max_in_flight_volume_bytes: Option<usize>,
+    #[serde(default)]
+    max_acquisition_bytes: Option<usize>,
+    #[serde(default)]
     state: lattice_node::storage::StateRetention,
     #[serde(default)]
     block_bodies: lattice_node::storage::BodyRetention,
     genesis_cid: String,
+    #[serde(default)]
+    finality_window: Option<u64>,
+    #[serde(default)]
+    finality_windows: std::collections::BTreeMap<String, u64>,
     #[serde(default)]
     bootstrap_files: Vec<PathBuf>,
     identity_key: PathBuf,
@@ -32,6 +45,10 @@ struct Config {
     min_relay_fee: u64,
     #[serde(default = "overlay_default")]
     listen: SocketAddr,
+    #[serde(default)]
+    web_socket_port: Option<u16>,
+    #[serde(default)]
+    external_address: Option<std::net::IpAddr>,
     #[serde(default = "rpc_default")]
     rpc: SocketAddr,
     #[serde(default)]
@@ -79,6 +96,30 @@ struct Seed {
     public_key: String,
     host: String,
     port: u16,
+}
+fn overlay_config(
+    port: Option<u16>,
+    public_read: Option<SocketAddr>,
+    external_address: Option<std::net::IpAddr>,
+) -> anyhow::Result<lattice_node::runtime::network::OverlayConfig> {
+    use lattice_node::runtime::network::{OverlayConfig, WebSocketListener};
+    let bind = |port| SocketAddr::from(([0, 0, 0, 0], port));
+    let websocket = match port {
+        Some(0) => WebSocketListener::Off,
+        Some(port) => {
+            if public_read.is_some_and(|address| address.port() == port) {
+                bail!("webSocketPort must differ from publicRead port");
+            }
+            WebSocketListener::Required(bind(port))
+        }
+        None if public_read.is_some_and(|address| address.port() == 4002) => WebSocketListener::Off,
+        None => WebSocketListener::IfAvailable(bind(4002)),
+    };
+    Ok(OverlayConfig {
+        resources: Default::default(),
+        websocket,
+        external_address,
+    })
 }
 fn public_fetches_default() -> usize {
     4
@@ -239,7 +280,24 @@ async fn main() -> anyhow::Result<()> {
         "chainPeer": config.chain_peer,
         "policyModule": config.policy_module.iter().map(|p|resolve(base,p)).collect::<Vec<_>>()
     });
-    let mut host = start_with_hosted_configuration(
+    let mut overlay = overlay_config(
+        config.web_socket_port,
+        config.public_read,
+        config.external_address,
+    )?;
+    let finality = FinalityWindows::new(config.finality_window, config.finality_windows)?;
+    if let Some(value) = config.serving_max_concurrent {
+        overlay.resources.serving_max_concurrent = value;
+    }
+    if let Some(value) = config.serving_max_in_flight_volume_bytes {
+        overlay.resources.serving_max_in_flight_volume_bytes = value;
+    }
+    if let Some(value) = config.max_acquisition_bytes {
+        overlay.resources.max_acquisition_bytes = value;
+    }
+    overlay.resources.validate()?;
+    let serving_in_flight_bytes = overlay.resources.serving_max_in_flight_volume_bytes;
+    let mut host = start_with_hosted_overlay_configuration(
         HostConfig {
             directory: directory.clone(),
             genesis_cid: config.genesis_cid,
@@ -266,6 +324,8 @@ async fn main() -> anyhow::Result<()> {
             public_submit: config.public_submit,
         },
         hosting,
+        finality,
+        overlay,
     )
     .await?;
     let setup = async {
@@ -314,11 +374,12 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(|listener| listener.local_addr())
         .transpose()?;
-    let public_app = lattice_node::runtime::public_api::router_with_fetches(
+    let public_app = lattice_node::runtime::public_api::router_with_fetch_budget(
         Arc::new(Backend(host.handle.clone(), process_start_time)),
         config.public_read_rates,
         config.public_submit,
         config.public_read_fetches,
+        serving_in_flight_bytes,
     )?;
     let (public_stop, public_stopped) = tokio::sync::oneshot::channel::<()>();
     let mut public_server = tokio::spawn(async move {
@@ -338,7 +399,7 @@ async fn main() -> anyhow::Result<()> {
     });
     println!(
         "{}",
-        serde_json::json!({"event":"ready","rpc":address.to_string(),"overlay":host.overlay_addr.to_string(),"publicKey":host.public_key,"publicRead":public_address.map(|a|a.to_string())})
+        serde_json::json!({"event":"ready","rpc":address.to_string(),"overlay":host.overlay_addr.to_string(),"webSocket":host.websocket_addr.map(|a| a.to_string()),"publicKey":host.public_key,"publicRead":public_address.map(|a|a.to_string())})
     );
     enum End {
         Signal(anyhow::Result<()>),
@@ -370,5 +431,34 @@ async fn main() -> anyhow::Result<()> {
             r??;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use lattice_node::runtime::network::WebSocketListener;
+    #[test]
+    fn browser_listener_default_off_required_and_public_read_collision() {
+        assert!(
+            matches!(overlay_config(None, None, None).unwrap().websocket,
+            WebSocketListener::IfAvailable(address) if address.port() == 4002)
+        );
+        assert!(matches!(
+            overlay_config(Some(0), None, None).unwrap().websocket,
+            WebSocketListener::Off
+        ));
+        let public = Some("0.0.0.0:4002".parse().unwrap());
+        assert!(matches!(
+            overlay_config(None, public, None).unwrap().websocket,
+            WebSocketListener::Off
+        ));
+        assert!(overlay_config(Some(4002), public, None).is_err());
+        let external = Some("2001:db8::7".parse().unwrap());
+        let options = overlay_config(Some(4003), public, external).unwrap();
+        assert_eq!(options.external_address, external);
+        assert!(
+            matches!(options.websocket, WebSocketListener::Required(address) if address.port() == 4003)
+        );
     }
 }

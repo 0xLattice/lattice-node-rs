@@ -27,6 +27,8 @@ pub struct ChildChainCore {
     pending: super::pending::PendingQueue,
     proof_config: super::child_proofs::ChildProofConfig,
     header_config: super::headers::HeaderConfig,
+    declined: DeclinedSet,
+    finality_height: u64,
     storage: Arc<NodeStorage>,
     tree: ChainTree,
     sync: HeaderSync,
@@ -108,6 +110,8 @@ impl ChildChainCore {
             pending: Default::default(),
             proof_config: Default::default(),
             header_config: Default::default(),
+            declined: Default::default(),
+            finality_height: 0,
             storage,
             tree,
             sync: HeaderSync::new(log, snapshot.cursors, config),
@@ -128,6 +132,26 @@ impl ChildChainCore {
             "dropped"
         }
     }
+    pub fn set_finality_window(&mut self, window: Option<u64>) {
+        let window = window.filter(|n| *n > 0);
+        if self.header_config.finality != window {
+            self.declined = DeclinedSet::default();
+        }
+        self.header_config.finality = window;
+        self.finality_height = super::finality::height(&self.tree);
+    }
+    fn finality_done(&self, entry: &LogEntry) -> bool {
+        self.declined.contains(&entry.block)
+            || (entry.kind == LogKind::Proof
+                && self.tree.height(&entry.block).is_some_and(|height| {
+                    super::finality::past(&self.tree, height, self.header_config.finality)
+                }))
+    }
+    pub(crate) fn acquisition_frontier(&self) -> std::collections::BTreeSet<String> {
+        super::body::next_to_connect(&self.tree, self.body_window)
+            .into_iter()
+            .collect()
+    }
     pub fn tree(&self) -> &ChainTree {
         &self.tree
     }
@@ -137,7 +161,15 @@ impl ChildChainCore {
     pub fn awaiting_parent(&self) -> &BTreeMap<String, CrossChainEvidenceRequirement> {
         &self.bodies.awaiting_parent
     }
+    fn refresh_finality(&mut self) {
+        let height = super::finality::height(&self.tree);
+        if height < self.finality_height {
+            self.declined = DeclinedSet::default();
+        }
+        self.finality_height = height;
+    }
     fn finish(&mut self, sync: SyncTurn, now: i64) -> ChainEffects {
+        self.refresh_finality();
         ChainEffects {
             sync: sync.effects,
             headers: vec![],
@@ -145,6 +177,7 @@ impl ChildChainCore {
         }
     }
     fn published(&mut self, admitted: HeaderImport, now: i64) -> Result<ChainEffects, StoreError> {
+        self.refresh_finality();
         let mut next = self.sync.clone();
         let mut turn = match admitted {
             HeaderImport::Applied(update) => next
@@ -154,7 +187,11 @@ impl ChildChainCore {
         };
         let log = next.log.clone();
         for peer in next.peers.keys().cloned().collect::<Vec<_>>() {
-            next.advance_cursor(&peer, |e| log.contains(e), &mut turn);
+            next.advance_cursor(
+                &peer,
+                |e| log.contains(e) || self.finality_done(e),
+                &mut turn,
+            );
         }
         self.persist_cursors(&turn.cursors)?;
         self.sync = next;
@@ -179,9 +216,9 @@ impl ChildChainCore {
         let turn = self.sync.receive_request(peer, message, &self.tree, now);
         self.finish(turn, now)
     }
-    /// Cursors acknowledge only entries already in this level's durable weigh
-    /// log. In particular, a held child header does not acknowledge an unseen
-    /// carrier proof naming that header.
+    /// Cursors acknowledge durable weigh-log entries or entries declined by
+    /// the configured finality policy. Otherwise a held child header does not
+    /// acknowledge an unseen carrier proof naming that header.
     pub fn stream_page(
         &mut self,
         peer: &PeerId,
@@ -189,8 +226,24 @@ impl ChildChainCore {
         now: i64,
     ) -> Result<ChainEffects, StoreError> {
         let mut next = self.sync.clone();
-        let applied = |entry: &LogEntry| self.sync.log.contains(entry);
+        let applied = |entry: &LogEntry| self.sync.log.contains(entry) || self.finality_done(entry);
         let turn = next.receive_page(peer, page, now, applied, |e| !applied(e));
+        self.persist_cursors(&turn.cursors)?;
+        self.sync = next;
+        Ok(self.finish(turn, now))
+    }
+    fn advance_finality_cursors(&mut self, now: i64) -> Result<ChainEffects, StoreError> {
+        self.refresh_finality();
+        let mut next = self.sync.clone();
+        let log = next.log.clone();
+        let mut turn = SyncTurn::default();
+        for peer in next.peers.keys().cloned().collect::<Vec<_>>() {
+            next.advance_cursor(
+                &peer,
+                |e| log.contains(e) || self.finality_done(e),
+                &mut turn,
+            );
+        }
         self.persist_cursors(&turn.cursors)?;
         self.sync = next;
         Ok(self.finish(turn, now))
@@ -255,7 +308,9 @@ impl ChildChainCore {
     }
     pub fn tick(&mut self, now: i64) -> Result<ChainEffects, StoreError> {
         let log = self.sync.log.clone();
-        let turn = self.sync.tick(now, |e| !log.contains(e));
+        let mut next = self.sync.clone();
+        let turn = next.tick(now, |e| !log.contains(e) && !self.finality_done(e));
+        self.sync = next;
         let mut effects = self.finish(turn, now);
         let pending = self.drain_proven_headers(now)?;
         effects.sync.extend(pending.sync);

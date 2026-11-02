@@ -19,3 +19,5 @@ pub mod child_proofs;
 pub mod peer_search;
 
 pub mod read_endpoints;
+
+pub mod finality;
